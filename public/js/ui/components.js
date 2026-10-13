@@ -825,13 +825,52 @@ export function PingPill({ ms, online = true, class: cls }) {
   </span>`;
 }
 
-/** Live authenticated-player count delivered by the WebSocket presence stream. */
+/**
+ * Live authenticated-player count delivered by the WebSocket presence stream.
+ * The pill is a button: clicking it loads `GET /api/online` (docs/CUSTOM_API.md) and shows the online nicknames.
+ */
 export function OnlineCount({ online, class: cls }) {
   const value = Number.isInteger(online) && online >= 0 ? online : '--';
-  return html`<span class=${cx('ping', 'online-count', cls)} title=${t('当前在线人数')}>
-    <${Icon} name="users" class="ping__icon" />
-    <span class="ping__value num">${value}</span><span class="ping__unit">${t('在线')}</span>
-  </span>`;
+  const [open, setOpen] = useState(false);
+  const [players, setPlayers] = useState(null); // null: 还没加载/正在加载
+  const [failed, setFailed] = useState(false);
+  const load = () => {
+    setFailed(false);
+    setPlayers(null);
+    const doFetch = globalThis.fetch;
+    if (typeof doFetch !== 'function') { setFailed(true); return; }
+    doFetch('/api/online', { headers: { accept: 'application/json' } })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
+      .then((body) => setPlayers(Array.isArray(body?.players) ? body.players : []))
+      .catch(() => { setFailed(true); setPlayers([]); });
+  };
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next) load();
+  };
+  return html`<${Fragment}>
+    <button type="button" class=${cx('ping', 'online-count', 'online-count--btn', cls)} title=${t('当前在线人数')}
+            aria-haspopup="dialog" aria-expanded=${open ? 'true' : 'false'} onClick=${toggle}>
+      <${Icon} name="users" class="ping__icon" />
+      <span class="ping__value num">${value}</span><span class="ping__unit">${t('在线')}</span>
+    </button>
+    <${Modal} open=${open} title=${t('在线玩家')} width="min(92vw, 460px)"
+             micro=${Number.isInteger(online) && online >= 0 ? t('共 {n} 人', { n: online }) : ''}
+             onClose=${() => setOpen(false)}
+             actions=${html`<${Button} variant="secondary" onClick=${() => setOpen(false)}>${t('关闭')}<//>`}>
+      ${failed
+        ? html`<p class="online-list__hint">${t('读取失败，请稍后重试。')}</p>
+            <${Button} variant="secondary" size="sm" onClick=${load}>${t('重试')}<//>`
+        : players === null
+          ? html`<p class="online-list__hint"><${Spinner} size="sm" />${t('读取中…')}</p>`
+          : players.length === 0
+            ? html`<p class="online-list__hint">${t('暂无在线玩家。')}</p>`
+            : html`<ul class="online-list">${players.map((name, i) => html`<li class="online-list__item" key=${`${i}:${String(name)}`}>
+                <span class="online-list__num num">${i + 1}</span><span class="online-list__name">${name}</span>
+              </li>`)}</ul>`}
+    </${Modal}>
+  </${Fragment}>`;
 }
 
 /**

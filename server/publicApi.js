@@ -4,6 +4,9 @@ import { createHash } from 'node:crypto';
 import { DIFFICULTY_NAMES, MAX_SEATS } from '../shared/constants.js';
 import { clientAddress, limitKeyOf, TokenBucket } from './net.js';
 
+/** Names returned by /api/online (a very large lobby is truncated; `total` still reports the truth). */
+export const MAX_ONLINE_NAMES = 200;
+
 export function roomStatus(room, serverNow) {
   if (!room || room.disposed) return null;
   const inMatch = !!room.match;
@@ -38,11 +41,46 @@ export function roomStatus(room, serverNow) {
 }
 
 /** Returns true if this API router handled the request. Address resolution shares the WebSocket TRUST_PROXY rules. */
-export function createPublicApi({ lobby, announcements, trustProxy, sendJson, sendError, now = Date.now }) {
+export function createPublicApi({ lobby, net = null, announcements, trustProxy, sendJson, sendError, now = Date.now }) {
   const buckets = new Map();
   let sweptAt = now();
   let announcementReadAt = now();
+  // GET /api/online — the client's «who is online» list (docs/CUSTOM_API.md).
+  const onlineBuckets = new Map();
+  let onlineSweptAt = now();
   return async (req, res, pathname) => {
+    // The authenticated players' nicknames. Read-only and rate limited like /api/rooms; never session ids,
+    // tokens, rooms or match data.
+    if (pathname === '/api/online') {
+      res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+      const at = now();
+      if (at - onlineSweptAt >= 60000) {
+        for (const [key, bucket] of onlineBuckets) if (at - bucket.at >= 60000) onlineBuckets.delete(key);
+        onlineSweptAt = at;
+      }
+      const { ip } = clientAddress(req, trustProxy);
+      const key = limitKeyOf(ip);
+      let bucket = onlineBuckets.get(key);
+      if (!bucket) { bucket = new TokenBucket(1, 5, at); onlineBuckets.set(key, bucket); }
+      if (!bucket.take(at)) {
+        res.setHeader('Retry-After', '1');
+        sendJson(req, res, 429, { error: 'RATE_LIMITED' });
+      } else if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.setHeader('Allow', 'GET, HEAD');
+        sendJson(req, res, 405, { error: 'METHOD_NOT_ALLOWED' });
+      } else {
+        const names = net ? net.onlineNames : [];
+        const list = Array.isArray(names) ? names : [];
+        sendJson(req, res, 200, {
+          online: net ? net.onlineCount : 0,
+          total: list.length,
+          players: list.slice(0, MAX_ONLINE_NAMES),
+          serverNow: at,
+        });
+      }
+      return true;
+    }
+
     if (/^\/api\/rooms(?:\/|$)/i.test(pathname)) {
       res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
       const at = now();

@@ -1,6 +1,6 @@
 # 公开 HTTP 查询 API
 
-这三个接口无需账号、Cookie 或令牌，不创建会话、不占用席位。时间戳均为 Unix 毫秒。JSON 响应使用 `Content-Type: application/json; charset=utf-8`、`Cache-Control: no-store`；HEAD 状态码及响应头与 GET 一致，但不返回正文。反向代理 / CDN 应将这些路径转到游戏进程并遵循 `no-store`。
+这些接口无需账号、Cookie 或令牌，不创建会话、不占用席位。时间戳均为 Unix 毫秒。JSON 响应使用 `Content-Type: application/json; charset=utf-8`、`Cache-Control: no-store`；HEAD 状态码及响应头与 GET 一致，但不返回正文。反向代理 / CDN 应将这些路径转到游戏进程并遵循 `no-store`。
 
 ## 房间状态
 
@@ -105,3 +105,19 @@
 ```
 
 上例于 12:00 到期。当前文件无效或不可读时，HTTP API 返回 `null`；游戏内原有“保留上次有效排期直到到期”的行为继续生效。无写入 API，无 CORS。其他方法返回 HTML 错误页，状态 405、`Allow: GET, HEAD`。
+
+## 在线玩家
+
+`GET /api/online`、`HEAD /api/online` 返回当前**已认证且在线**的玩家昵称（与客户端顶栏「在线 N」同一判定：会话仍绑定在自己的 WebSocket 上）。不需要参数，不返回会话 ID、令牌、房间或对局数据。
+
+```json
+{ "online": 3, "total": 3, "players": ["Alice", "Bob", "Carol"], "serverNow": 1791806015350 }
+```
+
+| 状态 | 响应 | 说明 |
+|---|---|---|
+| 200 | 上面的结构 | `players` 按昵称排序；超过 200 人时截断，`total` 仍是真实人数 |
+| 405 | `{"error":"METHOD_NOT_ALLOWED"}` | 非 GET / HEAD，带 `Allow: GET, HEAD` |
+| 429 | `{"error":"RATE_LIMITED"}` | 独立令牌桶：每秒补充 1 次、突发 5 次（与 `/api/rooms` 各自计数；地址识别同样遵循 `TRUST_PROXY`） |
+
+响应带 `X-Robots-Tag: noindex, nofollow, noarchive`，不开放 CORS。游戏客户端在首页 / 大厅 / 房间点击「在线」胶囊时按需调用一次；WebSocket 的 `presence` 广播仍只带人数。

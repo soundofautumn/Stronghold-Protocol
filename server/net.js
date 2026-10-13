@@ -614,6 +614,17 @@ export class Network {
     return n;
   }
 
+  /** Nicknames of those same sessions (one per player, sorted) — the public /api/online list. */
+  get onlineNames() {
+    const byPlayer = new Map();
+    for (const conn of this.conns.values()) {
+      const s = conn.session;
+      if (!s?.connected || s.ws !== conn.ws) continue;
+      if (typeof s.name === 'string' && s.name) byPlayer.set(s.playerId, s.name);
+    }
+    return [...byPlayer.values()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  }
+
   /** Lowest-priority periodic refresh (including unchanged counts). Welcome remains immediate.
    * Keep only the latest pending count; never put presence behind already queued socket traffic. */
   broadcastPresence() {

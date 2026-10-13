@@ -277,3 +277,46 @@ test('popup announcement API is independent of the existing scrolling announceme
   assert.equal(await read('/api/popup-announcement'), null);
   assert.equal((await read('/api/announcement')).text, scroll.text);
 });
+
+test('online API lists the authenticated players and their nicknames without private fields, and is rate limited', async (t) => {
+  const srv = await boot(t);
+
+  const empty = await request(srv, '/api/online');
+  assert.equal(empty.status, 200);
+  const none = JSON.parse(empty.body);
+  assert.equal(none.online, 0);
+  assert.deepEqual(none.players, []);
+  assert.equal(none.total, 0);
+  assert.equal(empty.headers['x-robots-tag'], 'noindex, nofollow, noarchive');
+
+  const a = await player(t, srv, 'Alice');
+  const b = await player(t, srv, 'Bob');
+  const r = await request(srv, '/api/online');
+  assert.equal(r.status, 200);
+  const body = JSON.parse(r.body);
+  assert.equal(body.online, 2);
+  assert.equal(body.total, 2);
+  assert.deepEqual([...body.players].sort(), ['Alice', 'Bob']);
+  assert.ok(!/playerId|token|session|"ws"/.test(r.body), 'no private fields');
+
+  const head = await request(srv, '/api/online', { method: 'HEAD' });
+  assert.equal(head.status, 200);
+
+  const post = await request(srv, '/api/online', { method: 'POST' });
+  assert.equal(post.status, 405);
+  assert.equal(post.headers.allow, 'GET, HEAD');
+
+  // 1 次/秒、突发 5：连续查询最终必然被限流
+  let limited = 0;
+  for (let i = 0; i < 10; i++) {
+    const x = await request(srv, '/api/online');
+    if (x.status === 429) { limited++; assert.equal(x.headers['retry-after'], '1'); }
+  }
+  assert.ok(limited >= 1, 'a burst of queries is rate limited');
+
+  // 限流后的响应是标准错误体（或被补充令牌后放行）
+  const tailBody = JSON.parse((await request(srv, "/api/online")).body);
+  assert.ok(tailBody.error === "RATE_LIMITED" || Number.isInteger(tailBody.online));
+  a.close();
+  b.close();
+});

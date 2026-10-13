@@ -1234,3 +1234,14 @@
   --bk-c: var(--red-premium);
 }
 .crash__box h2 { font-size: calc(.3 * var(--utility-text, var(--t))); }
+
+/* ---------------------------------------------------------------------------------------------------
+   Online players (online-count pill → OnlineCount modal: GET /api/online)
+   --------------------------------------------------------------------------------------------------- */
+.online-count--btn { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; }
+.online-count--btn:hover, .online-count--btn[aria-expanded="true"] { --pc: var(--mint-400); color: var(--text-hi); }
+.online-list { display: flex; flex-direction: column; gap: .06rem; margin: 0; padding: 0; list-style: none; max-height: 46vh; overflow-y: auto; }
+.online-list__item { display: flex; align-items: center; gap: .1rem; padding: .07rem .12rem; border: 1px solid var(--line); border-radius: .06rem; background: rgba(255, 255, 255, .02); }
+.online-list__num { flex: none; min-width: .3rem; font-size: calc(.13 * var(--utility-text, var(--t))); color: var(--text-dim); text-align: right; }
+.online-list__name { font-size: calc(.16 * var(--utility-text, var(--t))); color: var(--text-hi); word-break: break-all; }
+.online-list__hint { display: flex; align-items: center; gap: .1rem; margin: 0 0 .12rem; font-size: calc(.15 * var(--utility-text, var(--t))); color: var(--text-lo); }
