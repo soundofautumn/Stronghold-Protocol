@@ -1,8 +1,16 @@
 # Assets: sources, layout, manifest, credits
 
+本分支可选干员皮肤见 [SKINS.md](SKINS.md)：部署端安装、观看者默认不启用、独立 `preloadSkins`，
+未预载时按实际显示请求，不随必备或其他可选音频自动下载；安装后同步数据/素材 CDN 并更新 SW。
+
 Owner: `tools/fetch-assets.mjs` and `tools/assets/*`. Research background: `docs/research/07-assets.md`.
 
 All official game art, Spine models and audio are **downloaded at install time**. They are never committed; `public/assets/` is git-ignored.
+
+The UI sound `audio.sfx.ui.bondUp` is the official `ON_ACT1AUTOCHESS_ADD_BOND` bank's
+`act1autochess_b_ui_buffup`. Live prep/battle layer gains use it as well as bond activation. Its bank settings are
+`maxSoundAllowed: 1` and `popOldest: true`: one dedicated SFX channel, replacing the previous sound without an extra
+cooldown. It respects the SFX/mute settings; a stale asynchronous decode cannot restart a replaced cue (#482).
 All downloaded game assets the client needs are listed in **`data/assets.json`**. Game-art requests must use that manifest.
 The original project icons below are shipped static files, not downloaded game assets.
 
@@ -250,6 +258,45 @@ running; 暂停下载 stops them and 关闭预载 disables automatic downloading
   has brought the set up to date, the caches of earlier layouts and the entries the manifest no longer lists are
   dropped. The host therefore has to serve `/resource-sw.js` and never cache it at the edge.
 
+### 离线分析与制作增量资源 ZIP
+
+For dual-format PNG/WebP compression, retained legacy URLs, static Brotli/gzip siblings and old-cache/ZIP
+migration, see [ASSET_SHRINK.md](ASSET_SHRINK.md). It operates on a private candidate, not live files; generated
+art/hashes never enter source commits. Its default conversion does not include optional audio re-encoding.
+
+`tools/resource_delta.py` 使用 Python 3.10+ 标准库，对比两个由资源管理窗口导出的 ZIP，
+无需安装依赖，也不将素材解压到磁盘。例如在仓库根目录运行：
+
+```powershell
+python tools/resource_delta.py `
+  --base "artifacts/resources/baselines/全量资源包stronghold-resources-76a510f2c124.zip" `
+  --target "artifacts/resources/baselines/stronghold-resources-fad149b815dd.zip" `
+  --output "artifacts/resources/deltas/0.2.3/stronghold-resources-76a510f2c124-to-fad149b815dd-delta.zip"
+```
+
+- 先完整校验两个输入包的 CRC、实际大小和版本对应摘要；v1 必须通过 SHA-256 和 SHA-1 短指纹，
+  v2 必须通过完整 SHA-1 和短指纹。随后按规范化资源路径、实际完整 SHA-1 和大小比较，
+  不会因 v1/v2 清单格式变化或方括号路径编码变化重复打包。
+- 增量 ZIP 只含新增和内容变化的完整文件，重新编号并生成标准 v2 `stronghold-resources.json`，
+  保留目标 `resourceVersion`。输出完成后再次逐文件校验。不是二进制差分，也不是服务端发行更新包。
+- 默认输出 `<目标包名>-delta.zip` 和同名 `.report.json`；可通过 `--report` 指定报告路径。
+  `--analyze-only` 只校验、对比并写报告，不生成 ZIP。没有新增或变化时只写报告，不生成客户端拒绝的空包。
+- 报告包含新增、变化、未变化、目标包中缺失的数量/字节数、新增/变化/缺失文件明细及增量目录统计。
+  `absentFromTarget` 只表示目标 ZIP 没有该文件：导出包可能不完整，不能据此认定游戏删除了资源。
+  不在增量 ZIP 中写入报告或删除指令。
+- 两个原始 ZIP 不变，已有输出和报告拒绝覆盖。流式读写并校验，单次正文读取最多 1 MiB；
+  保持 24 MiB 单文件、50,000 资源、32 MiB 清单及 2 GiB 包限制。失败时删除正在写入的不完整输出。
+- 玩家应先导入旧全量包，再导入增量包。现有客户端按**当前服务器**清单指纹复用缓存，
+  并继续下载所选范围内尚缺的资源；已有旧缓存不会因为缺失列表被删除。
+  增量包不能替代首次安装的全量资源，服务端仍须同步部署当前素材和真实指纹表。
+
+验证脚本及现有导入兼容性：
+
+```powershell
+python -m unittest discover -s test/resources -p resource_delta_test.py
+node --test test/resources/delta-script.test.js test/resources/archive.test.js
+```
+
 ## Running
 
 ```bash
@@ -356,6 +403,7 @@ The research JSONs in `docs/research/` (03, 05, 07) define **which** ids are nee
 | Enemy Spine (PC build, premultiplied alpha) | isHarryh/Ark-Models `models_enemies/{key}/`, file names from `models_data.json` | `spine/enemy/{enemyId}/{stem}.*` |
 | Enemy Spine that no dump carries (灼热源石虫 / 炽焰源石虫) | the local client only (`tools/local-extract/extract.py ENEMY_SPINES`, optional); never downloaded and never required: an overlay of the web alias (`enemies[id].spineLocal`) | `local/spine/enemy/{enemyId}/{stem}.*` (listed in `data/local-assets.json`) |
 | Original token Spine overlays (40 summons: most 自选 summons, 凯瑟琳's 爬行号·防护单元, 凛御银灰's 风雪之眼, 香槟炸弹) | local-client extraction (`tools/local-extract/extract.py TOKEN_SPINES`, optional); the original overlay is preferred, with any listed web model retained as fallback | `local/spine/token/{tokenId}/{stem}.*` (listed in `data/local-assets.json`) |
+| Official battlefield scenes (one per battlefield: meshes, lightmaps, albedo textures; DESIGN §15, DESIGN §30.21) | the scene bundles `scenes/activities/<season>/level_<stage>/…` (`tools/local-extract/extract.py --only scene`, optional). The client carries them only while the season runs; off season `tools/local-extract/fetch_scenes.py` downloads the bundles of the in-season version `26-04-13-12-31-42_e9b560` from the official CDN into `.cache/official-scenes/` (33 bundles, 22,801,308 bytes compressed on the Android list, md5-checked), and the materials / textures still come from the local client's theme bundles. The 0.2.5 full release zip includes the extracted files under `public/assets/local/scene/` when the maintainer extracted them before packaging; a lite zip and a source install may fetch and extract them (`node tools/setup.mjs --scenes`). The repository never stores the bundles or the extracted files. Without a scene the 3D board draws its procedural metal tiles | `local/scene/{stageId}/scene.json`, `scene.bin`, `lm{i}.*`; `local/scene/tex/{texture}.*` (listed in `data/local-assets.json`) |
 | BGM | AA2 `voice` branch `audio/sound_beta_2/music/**` (大厅/休整期 `act1autochess`, 开战 `act13side/m_bat_kazimierz2_{1,2}` — 骑士之日 / 无畏者; the 开战 track follows the round: `_2` 无畏者 rounds 1–7, `_1` 骑士之日 from round 8) | `audio/bgm/{file}.mp3` |
 | SFX (UI, battle, per unit) | AA2 `voice` `audio/sound_beta_2/**`, mapped from `audio_data.json` banks | `audio/sfx/{same sub-path}.mp3` |
 | 干员战斗语音 | AA2 `voice` `audio/sound_beta_2/voice_cn/{charId}/cn_nn.mp3` (Chinese, `audio.voice`) and `voice/{charId}/cn_nn.mp3` (Japanese, `audio.voiceJp`: the same file names) — the lines `charword_table.json` lists (`placeType` = when the game plays one, `voiceAsset` = the path); `--voice-lang=jp|en|kr` fills `audio.voice` from `voice/`, `voice_en/`, `voice_kr/` instead | `audio/voice/cn/{charId}/{cn_nn}.mp3`, `audio/voice/jp/{charId}/{cn_nn}.mp3` (`audio/voice/{lang}/…` for another `--voice-lang`) |
@@ -401,7 +449,15 @@ The `stem` of a Spine model is the upstream file name. Two examples: `char_107_l
 - **Fonts:** OTF/TTF files are converted to WOFF2 by a built-in encoder (`tools/assets/woff2.mjs`: Brotli with null transforms).
   - Its output was verified lossless against Google's reference `woff2` decoder.
   - `fonts.css` lists WOFF2 first and falls back to the original file.
-- Images stay PNG. WebP conversion is not done: it would need a native dependency.
+- The default fetch pipeline still produces PNG. Optional offline compression now uses Pillow in
+  `tools/shrink-assets.py`: ordinary color art quality 95, tutorial art quality 90, Spine/data maps lossless;
+  both emote trees remain PNG. It keeps original files and selects verified WebP/`.webp.atlas` siblings through
+  matching manifests. See [ASSET_SHRINK.md](ASSET_SHRINK.md) for candidate-only conversion and legacy cache/ZIP
+  migration. The local extractor remains a separate upstream pipeline: `extract.py --webp` produces board/guide
+  copies without the client (board color q95, normal/data maps lossless, local guide q90), and keeps PNGs for
+  `tools/crop-board-atlas.mjs`. Scene lightmaps from older extraction may still be lossy until the optional
+  candidate conversion regenerates them from their retained PNGs. Do not infer codec policy merely from a sibling's
+  presence or manually reuse the original PNG fingerprint.
 
 ## Manifest schema (`data/assets.json`)
 

@@ -55,11 +55,12 @@ function useResources() {
 
 function stateText(st, enabled) {
   if (st.archive) return st.archive === 'import' ? t('正在导入') : t('正在导出');
+  if (enabled && st.combatPaused && !st.manualPaused) return t('战斗中暂停');
   if (st.phase === 'foreign') return t('另一标签页处理中');
   if (busy(st)) return t('处理中');
   if (st.cacheVerified === false && st.selectionComplete && st.tier1Total) return t('缓存索引已读取');
   if (st.complete) return t('全部已保存');
-  if (st.selectionComplete && st.tier1Total) return st.optional ? t('所选资源已齐全。') : t('必备已保存');
+  if (st.selectionComplete && st.tier1Total) return st.optional || st.skins ? t('所选资源已齐全。') : t('必备已保存');
   return enabled ? t('已暂停') : t('未开启');
 }
 
@@ -85,7 +86,7 @@ export function ResourceLauncher({ enabled }) {
   </div>`;
 }
 
-function ResourceTier({ st, tier, optional, onOptional, voiceLang, onVoiceLang, disabled }) {
+function ResourceTier({ st, tier, optional, onOptional, voiceLang, onVoiceLang, skins, onSkins, disabled }) {
   const groups = st.groups.filter((g) => g.tier === tier);
   const chosen = groups.filter((g) => g.selected !== false);
   const total = chosen.reduce((n, g) => n + g.wanted, 0);
@@ -110,6 +111,9 @@ function ResourceTier({ st, tier, optional, onOptional, voiceLang, onVoiceLang, 
       <p>${t('仅影响预载范围；播放语言仍在设置中选择。切换后保留已有缓存。')}</p>
       ${!optional ? html`<p>${t('勾选“同时预载”后下载所选语音。')}</p>` : null}
     </fieldset>` : null}
+    ${tier === 2 ? html`<label class="resource-choice resource-skin-choice"><input type="checkbox" checked=${skins} disabled=${disabled}
+      onChange=${(e) => onSkins(e.currentTarget.checked)} />${t('预载皮肤')}</label>
+      <p class="resource-skin-hint">${t('独立于“同时预载”；不勾选时，启用的皮肤仅在显示时按需加载。保留已有缓存。')}</p>` : null}
     <div class="resource-tier__summary"><span class="num">${t('{done} / {total} 个文件', { done, total })}</span>
       <span class="num">${unknown ? t('部分大小未知') : `${formatBytes(bytes)} / ${formatBytes(totalBytes)}`}</span></div>
     <${ProgressBar} value=${done} max=${Math.max(1, total)} size="sm" tone=${tier === 1 ? 'mint' : 'amber'} />
@@ -125,7 +129,7 @@ function ResourceTier({ st, tier, optional, onOptional, voiceLang, onVoiceLang, 
 }
 
 /** Mounted once in main.js, above all screens including the settings modal. */
-export function ResourceHost({ enabled, optional, voiceLang = 'cn', onVoiceLang, onChange, onOptional }) {
+export function ResourceHost({ enabled, optional, voiceLang = 'cn', onVoiceLang, skins = false, onSkins, onChange, onOptional }) {
   const { open } = useStore((s) => s, Object.is, resourceUi);
   const st = useResources();
   const fileInput = useRef(null);
@@ -153,14 +157,16 @@ export function ResourceHost({ enabled, optional, voiceLang = 'cn', onVoiceLang,
   return html`<${Modal} open=${open} onClose=${closeResources} title=${t('预载资源管理')} micro="RESOURCE MANAGER" class="resource-modal" utility=${true}
     actions=${html`
       ${busy(st) ? html`<${Button} variant="secondary" icon="hourglass" onClick=${pauseResources}>${archiveBusy ? t('取消处理') : t('暂停下载')}<//>`
-        : html`<${Button} variant="primary" icon="play" disabled=${!st.supported}
+        : html`<${Button} variant="primary" icon="play" disabled=${!st.supported || st.combatPaused}
           onClick=${() => enabled ? startResources() : onChange(true)}>${st.selectionComplete ? t('检查资源') : enabled ? t('继续下载') : t('开始预载')}<//>`}
+      ${enabled && st.combatPaused && !st.manualPaused && !archiveBusy ? html`<${Button} variant="secondary" icon="hourglass"
+        onClick=${pauseResources}>${t('暂停下载')}<//>` : null}
       <${Button} variant="secondary" onClick=${closeResources}>${t('关闭')}<//>`}>
     <div class="resource-manager">
       <p class="resource-manager__intro">${t('先预载必备资源；可选资源可按需加载。关闭此窗口后，下载会在后台继续。')}</p>
       <div class="resource-manager__tiers">
         <${ResourceTier} st=${st} tier=${1} />
-        <${ResourceTier} st=${st} tier=${2} optional=${optional} onOptional=${onOptional} voiceLang=${voiceLang} onVoiceLang=${onVoiceLang} disabled=${archiveBusy} />
+        <${ResourceTier} st=${st} tier=${2} optional=${optional} onOptional=${onOptional} voiceLang=${voiceLang} onVoiceLang=${onVoiceLang} skins=${skins} onSkins=${onSkins} disabled=${archiveBusy} />
       </div>
       <p class=${`resource-manager__status${st.error ? ' is-error' : ''}`} role="status" aria-live="polite">
         ${st.message || (enabled ? t('预载已开启') : t('选择下载范围，然后开始预载；也可以直接导入资源包。'))}</p>

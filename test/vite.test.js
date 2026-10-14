@@ -110,8 +110,9 @@ test('rendering, simulation and Three.js remain outside the initial static impor
   }
   visit('index.html');
   const initial = [...seen].map((key) => manifest[key].name);
-  for (const name of ['simulation', 'app', 'three', 'archive']) assert.ok(!initial.includes(name), `${name} loads lazily`);
+  for (const name of ['simulation', 'app', 'three', 'archive', 'announcementMarkdown']) assert.ok(!initial.includes(name), `${name} loads lazily`);
   assert.ok(Object.values(manifest).some((entry) => entry.name === 'archive' && entry.isDynamicEntry), 'ZIP library is available on demand');
+  assert.ok(Object.values(manifest).some((entry) => entry.name === 'announcementMarkdown' && entry.isDynamicEntry), 'popup Markdown is available on demand');
 });
 
 test('built simulation retains operator kits and domain mechanics: same deterministic battle results as Node', async () => {
@@ -144,7 +145,31 @@ test('built simulation retains operator kits and domain mechanics: same determin
   }
 });
 
-test('built simulation matches Node for sleep, Egir, stand-ins, self-selected kits and 0.2.4 bonds', async () => {
+test('built simulation carries owner skins without changing deterministic combat outcomes', async () => {
+  const simulation = Object.values(manifest).find(m => m.name === 'simulation');
+  const namespaces = Object.values(await import(pathToFileURL(path.join(outDir, simulation.file)).href));
+  const spec = namespaces.find(n => typeof n?.createBattleFromSpec === 'function');
+  const simdata = namespaces.find(n => typeof n?.setSimData === 'function');
+  const raw = getData({ log: { warn() {} } }); simdata.setSimData(raw);
+  const unit = { uid: 1, chessId: 'chess_char_1_01_a', row: 9, col: 5, dir: 'UP' };
+  const input = nativeSpec.buildBattleSpec({ seed: 29, kind: 'normal', stageId: Object.keys(raw.stages)[0],
+    players: [{ playerId: 'OTHER', units: [{ ...unit, skin: 'char_498_inside@kitchen#2' }] }],
+    spawns: [{ enemyKey: 'enemy_1007_slime', count: 2, time: 1 }], timeLimit: 50 });
+  const native = nativeSpec.createBattleFromSpec(input, new DataSource(raw), { quiet: true });
+  const built = spec.createBattleFromSpec(input, new simdata.DataSource(raw), { quiet: true });
+  native.start(); built.start();
+  assert.equal(built.fieldMeta().units.find(u => u.ownerId === 'OTHER')?.skin, 'char_498_inside@kitchen#2');
+  assert.deepEqual(built.fieldMeta(), native.fieldMeta());
+  native.runToEnd(100); built.runToEnd(100);
+  assert.deepEqual(spec.compactResult(built.result()), nativeSpec.compactResult(native.result()));
+  const plainInput = structuredClone(input);
+  for (const player of plainInput.players) for (const u of player.units) delete u.skin;
+  const plain = nativeSpec.createBattleFromSpec(plainInput, new DataSource(raw), { quiet: true });
+  plain.runToEnd(100);
+  assert.deepEqual(nativeSpec.compactResult(plain.result()), nativeSpec.compactResult(native.result()));
+});
+
+test('built simulation matches Node for sleep, Egir, stand-ins, self-selected kits and 0.2.5 funnels', async () => {
   const simulation = Object.values(manifest).find((m) => m.name === 'simulation');
   const namespaces = Object.values(await import(pathToFileURL(path.join(outDir, simulation.file)).href));
   const spec = namespaces.find((n) => typeof n?.createBattleFromSpec === 'function');
@@ -152,12 +177,12 @@ test('built simulation matches Node for sleep, Egir, stand-ins, self-selected ki
   const raw = getData({ log: { warn() {} } });
   simdata.setSimData(raw);
   const selected = [
-    ...scenariosOf('roster').filter((sc) => ['roster-039', 'roster-042'].includes(sc.id)),
+    ...scenariosOf('roster').filter((sc) => ['roster-004', 'roster-005', 'roster-007', 'roster-009', 'roster-039', 'roster-042'].includes(sc.id)),
     ...scenariosOf('bonds').filter((sc) => ['bond-egirShip-high', 'bond-raidShip-high', 'bond-steadShip-high'].includes(sc.id)),
     ...scenariosOf('standins').filter((sc) => ['standin-01', 'standin-09'].includes(sc.id)),
     ...scenariosOf('diy').filter((sc) => ['diy-001', 'diy-019', 'diy-048', 'diy-100', 'diy-135', 'diy-136'].includes(sc.id)),
   ];
-  assert.equal(selected.length, 13, 'includes Clementia in both forms and the 0.2.4 Raid/Steadfastness mechanisms');
+  assert.equal(selected.length, 17, 'includes Rockrock/Kjera/Vulpis in both forms, Clementia and Raid/Steadfastness');
   for (const sc of selected) {
     const input = nativeSpec.buildBattleSpec({ ...sc, battleId: sc.id, fieldId: sc.fieldId ?? 'g', content: 'full' });
     const options = { quiet: true, recordEvents: true };
@@ -171,6 +196,32 @@ test('built simulation matches Node for sleep, Egir, stand-ins, self-selected ki
     assert.deepEqual(spec.compactResult(built.result()), nativeSpec.compactResult(native.result()), sc.id);
     assert.deepEqual(built.snapshot(), native.snapshot(), `${sc.id}: final state`);
     assert.deepEqual(built.drainEvents(), native.drainEvents(), `${sc.id}: battle events`);
+  }
+});
+
+test('built Wisdel shadows obey boss/hidden field ownership exactly like Node, including solo empty halves', async () => {
+  const simulation = Object.values(manifest).find(m => m.name === 'simulation');
+  const namespaces = Object.values(await import(pathToFileURL(path.join(outDir, simulation.file)).href));
+  const spec = namespaces.find(n => typeof n?.createBattleFromSpec === 'function');
+  const simdata = namespaces.find(n => typeof n?.setSimData === 'function');
+  const raw = getData({ log: { warn() {} } });
+  simdata.setSimData(raw);
+  for (const kind of ['boss', 'hidden']) for (const side of ['L', 'R']) for (const pair of [false, true]) {
+    const units = [{ uid: 1, chessId: 'chess_char_6_diy1_a', diy: { charId: 'char_1035_wisdel', skillIndex: 0 }, row: 10, col: 8, dir: 'RIGHT' },
+      ...[[9, 8], [11, 8], [12, 8], [9, 9]].map(([row, col], i) => ({ uid: 2 + i, chessId: 'chess_char_1_01_a', row, col }))];
+    const players = [{ playerId: 'p1', side, units }];
+    if (pair) players.push({ playerId: 'p2', side: side === 'L' ? 'R' : 'L',
+      units: [{ uid: 11, chessId: 'chess_char_1_01_a', row: 12, col: 2 }] });
+    const input = nativeSpec.buildBattleSpec({ kind, seed: 557, round: 14, stageId: 'act2autochess_m02', players, timeLimit: 45 });
+    const native = nativeSpec.createBattleFromSpec(input, new DataSource(raw), { quiet: true, recordEvents: true });
+    const built = spec.createBattleFromSpec(input, new simdata.DataSource(raw), { quiet: true, recordEvents: true });
+    native.start(); built.start();
+    const shadows = b => b.allyUnits.filter(u => u.defId === 'token_10035_wisdel_wward').map(u => [u.tileR, u.tileC]);
+    assert.deepEqual(shadows(native), pair ? [[2, side === 'L' ? 11 : 9]] : [], `${kind}/${side}/${pair}: production field rule`);
+    assert.deepEqual(shadows(built), shadows(native), `${kind}/${side}/${pair}: bundled shadows`);
+    assert.deepEqual(built.snapshot(), native.snapshot());
+    assert.deepEqual(built.drainEvents(), native.drainEvents());
+    assert.equal(built.errors.length, 0);
   }
 });
 

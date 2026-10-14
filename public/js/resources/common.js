@@ -24,7 +24,10 @@ export const TIER_ESSENTIAL = 1;
 /** Optional: voices, sound effects, music and tutorial illustrations. */
 export const TIER_REST = 2;
 export const MANIFEST_URL = '/data/resource-manifest.json';
+export const PACK_MANIFEST_URL = '/data/resource-packs.json';
 export const SW_URL = '/resource-sw.js';
+/** A pack is a transport optimization, never a cache identity or a second hash authority. */
+export const RESOURCE_PACK_MAX_BYTES = 16_000_000;
 
 export const RESOURCE_GROUPS = Object.freeze({
   map: { name: N_('地图与棋盘'), tier: TIER_ESSENTIAL },
@@ -36,12 +39,15 @@ export const RESOURCE_GROUPS = Object.freeze({
   voice: { name: N_('其他角色语音'), tier: TIER_REST },
   sfx: { name: N_('音效'), tier: TIER_REST },
   music: { name: N_('背景音乐'), tier: TIER_REST },
+  skins: { name: N_('干员皮肤'), tier: TIER_REST },
   other: { name: N_('玩法说明与其他资源'), tier: TIER_REST },
 });
 
 export function resourceGroup(file) {
   const path = new URL(file.url, 'https://resources.invalid').pathname;
   if (file.tier === TIER_REST) {
+    // Skin model stems contain an outfit directory; handle a CDN prefix too.
+    if (/\/char\/avatar\/skin\//.test(path) || /\/spine\/op\/[^/]+\/[^/]+\/(?:front|back)\//.test(path)) return 'skins';
     if (/\/voice\/cn\//.test(path)) return 'voice_cn';
     if (/\/voice\/jp\//.test(path)) return 'voice_jp';
     if (/\/voice\//.test(path)) return 'voice';
@@ -61,10 +67,11 @@ export function normalizePreloadVoiceLang(value, fallback = 'cn') {
   return PRELOAD_VOICE_LANGS.includes(value) ? value : PRELOAD_VOICE_LANGS.includes(fallback) ? fallback : 'cn';
 }
 
-export function selectedResourceGroup(id, includeOptional, voiceLang = 'cn') {
+export function selectedResourceGroup(id, includeOptional, voiceLang = 'cn', preloadSkins = false) {
   const group = RESOURCE_GROUPS[id];
   if (!group) return false;
   if (group.tier === TIER_ESSENTIAL) return true;
+  if (id === 'skins') return preloadSkins === true;
   if (!includeOptional) return false;
   const lang = normalizePreloadVoiceLang(voiceLang);
   if (id === 'voice_cn') return lang === 'cn' || lang === 'all';
@@ -74,9 +81,9 @@ export function selectedResourceGroup(id, includeOptional, voiceLang = 'cn') {
 }
 
 /** UI/download completion uses the short, incrementally maintained category list, not manifest rescans. */
-export function resourceSelection(status, includeOptional, voiceLang) {
+export function resourceSelection(status, includeOptional, voiceLang, preloadSkins = false) {
   const groups = (status.groups || []).map((group) => ({ ...group,
-    selected: selectedResourceGroup(group.id, includeOptional, voiceLang) }));
+    selected: selectedResourceGroup(group.id, includeOptional, voiceLang, preloadSkins) }));
   const chosen = groups.filter((g) => g.selected);
   const selectedWanted = chosen.reduce((n, g) => n + g.wanted, 0);
   const selectedDone = chosen.reduce((n, g) => n + g.present, 0);
@@ -217,6 +224,24 @@ export function validateManifest(m) {
     if (f.hash != null && (typeof f.hash !== 'string' || !HASH_RE.test(f.hash))) throw new Error(`资源指纹无效：${f.url.slice(0, 80)}`);
   }
   return m;
+}
+
+/** Optional transport packs are advisory; invalid metadata falls back to file downloads. */
+export function validateResourcePacks(doc) {
+  if (!doc || doc.format !== 'stronghold-resource-pack-index' || doc.version !== 1
+    || doc.maxBytes !== RESOURCE_PACK_MAX_BYTES || !Array.isArray(doc.packs)) return [];
+  return doc.packs.filter((pack) => {
+    if (!pack || typeof pack.id !== 'string' || typeof pack.url !== 'string') return false;
+    let parsed;
+    try { parsed = new URL(pack.url, globalThis.location?.origin || 'https://resources.invalid'); } catch { return false; }
+    if (!['http:', 'https:'].includes(parsed.protocol)
+      || !/^\/resource-packs\/[A-Za-z0-9._-]+\.zip$/.test(parsed.pathname)
+      || parsed.username || parsed.password || parsed.search || parsed.hash
+      || !Number.isSafeInteger(pack.size) || pack.size <= 0 || pack.size > RESOURCE_PACK_MAX_BYTES
+      || !Array.isArray(pack.files) || pack.files.length === 0) return false;
+    return pack.files.every((file) => file && typeof file.url === 'string' && CONTENT_HASH_RE.test(file.hash)
+      && Number.isSafeInteger(file.size) && file.size >= 0);
+  });
 }
 
 /** Whether an error means "the browser is out of storage" (a quota failure must stop the run, not retry 4 000 times). */

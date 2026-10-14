@@ -1,3 +1,4 @@
+import { freezeSkins } from '../../shared/skins.js';
 // server/match/PlayerState.js — authoritative per-player state + every prep intent handler (DESIGN §6.2).
 //
 // Handlers validate → mutate → recompute bonds → mark the private view dirty. They never throw on bad input; they
@@ -26,7 +27,8 @@
 //     rerolls everything and the new slots stay frozen), level-up price = base − rounds elapsed (floor 0).
 //   * Merge: 3 normal copies (风丸 2) on board/hand/temp → 1 elite; equipment returns to the hand; a
 //     reward offer of 3 different free chess of tier min(level+1, 6) is queued (never one operator twice — user
-//     playtest #6 item 19; a short tier tops up from the tier below; pick 1, expires at prep end; an offer earned
+//     playtest #6 item 19; a short tier tops up from the tier below; the player's stocked 自选 of that tier joins,
+//     §30.23; pick 1, expires at prep end; an offer earned
 //     after the prep — SETTLE / Final Assault effects — is kept for the next prep). Where the elite goes (PRTS
 //     卫戍协议/帮助 "发送1名【精锐】状态的该干员至手牌区（若消耗已部署至作战区的干员，则发送至作战区对应位置）", user
 //     playtest #6 follow-up): when a consumed copy stood on the board, onto that copy's tile with its facing (of several,
@@ -116,7 +118,7 @@
 //                 battleInput
 //   views.js      pieceView, effectsView, m.private (privateView)
 //   diy.js        自选编队: the picks (setDiy), the player's data view, the DIY stock (initDiyStock, poolOf), the shop's
-//                 DIY draws (diyRollEntries), the pick of a piece (diyPickOf)
+//                 DIY draws (diyRollEntries) and the reward / grant draws (diyStockEntries), the pick of a piece (diyPickOf)
 //   common.js     HAND_SIZE, TEMP_SIZE, MAX_OFFER_SLOTS, OK, fail
 
 import { FIELD } from './board.js';
@@ -164,6 +166,10 @@ export class PlayerState {
     // 0.2.2: the per-operator 潜能 / 练度 ({} = every operator 潜能 6, 精英2 Lv.60 — bots always)
     this.ops = Object.freeze({});
     if (!this.isBot && (seat.loadout || seat.ops)) this.setLoadout(seat.loadout ?? null, seat.ops ?? null);
+    /** 皮肤 (docs/SKINS.md): frozen { [chessId]: skinId }, {} = every chess on its default model. Unlike the
+     * loadout these are PUBLIC (a teammate sees your skin), so they travel in Match.publicView(). */
+    // Match dirty sets are constructed AFTER its PlayerStates. Initial preferences must not notify yet.
+    this.skins = freezeSkins(this.isBot ? null : seat.skins, (id) => this.gd.chess(id));
     /**
      * 补位 (0.2.0): the base chess ids this player fields as their stand-ins — the seat's not-owned list when the match
      * started, re-checked against this match's data; frozen, sorted; [] = every operator owned (bots always)

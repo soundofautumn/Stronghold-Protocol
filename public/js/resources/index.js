@@ -2,12 +2,12 @@
 //
 // Bulk preload is off by default. The Service Worker is registered for every supported session, so resources loaded
 // during normal play are cached on demand. Turning bulk preload off only stops batch downloads; 「清理缓存」 still
-// deletes the runtime cache. Nothing here touches the match.
+// deletes the runtime cache. Combat temporarily pauses bulk work without changing the user's preload preference.
 //
 // The settings panel (public/js/ui/resourcePanel.js) renders `resourceState()`; main.js calls `syncResources()` with the
 // persisted setting at boot and on every settings change.
 
-import { CACHE_PREFIX, MANIFEST_URL, SW_URL, TIER_ESSENTIAL, TIER_REST, checkAbort, formatBytes, isQuotaError, resourceGroup, normalizePreloadVoiceLang, resourceSelection, selectedResourceGroup, validateManifest } from './common.js';
+import { CACHE_PREFIX, MANIFEST_URL, SW_URL, TIER_ESSENTIAL, TIER_REST, checkAbort, formatBytes, isQuotaError, resourceGroup, normalizePreloadVoiceLang, resourceSelection, selectedResourceGroup, validateManifest, validateResourcePacks } from './common.js';
 import { ResourceStore } from './store.js';
 import { t } from '../../../shared/i18n.js';
 
@@ -42,7 +42,10 @@ const state = {
   archiveGroup: '',
   optional: false,
   voiceLang: 'cn',
+  skins: false,
   selectionComplete: false,
+  combatPaused: false,
+  manualPaused: false,
   groups: [],
 };
 
@@ -55,9 +58,19 @@ let transferPromise = null;
 let archiveController = null;
 let optional = false;
 let voiceLang = 'cn';
+let skins = false;
 let syncRevision = 0;
 let workerPromise = null;
 let cancelBackgroundCheck = null;
+let combatPaused = false;
+let manualPaused = false;
+let combatRevision = 0;
+let resumeAfterCombat = false;
+let cancelOtherTabWatch = null;
+
+const combatMessage = () => t('战斗中已暂停批量预载，战斗结束后自动继续。');
+const manualMessage = () => t('已暂停，可继续下载或清理缓存。');
+const downloadBlocked = () => !current || combatPaused || manualPaused;
 
 /** Subscribe to preload state changes (returns the unsubscribe function). */
 export function subscribeResources(fn) {
@@ -73,6 +86,12 @@ export function resourceState() {
 function set(patch) {
   const before = JSON.stringify(state); // the state is small and flat: a cheap "did anything change" test
   Object.assign(state, patch);
+  // Async progress/inspection must not replace an automatic/manual pause with a late "download" or "ready" state.
+  if (current && !state.archive && (combatPaused || manualPaused)
+      && ['checking', 'download', 'foreign', 'ready', 'paused'].includes(state.phase)) {
+    state.phase = 'paused';
+    state.message = manualPaused ? manualMessage() : combatMessage();
+  }
   if (JSON.stringify(state) === before) return;
   for (const fn of [...listeners]) {
     try { fn(resourceState()); } catch (err) { console.error('[resources] listener failed', err); }
@@ -103,10 +122,10 @@ const counters = (s) => ({
   // migration (kept bytes) vs network (fetched bytes): 0 unless a run is/was in flight
   adopted: s.adopted ?? 0,
   downloaded: s.downloaded ?? 0,
-  ...resourceSelection(s, optional, voiceLang),
+  ...resourceSelection(s, optional, voiceLang, skins),
 });
 
-const selectionComplete = (s) => resourceSelection(s, optional, voiceLang).selectionComplete;
+const selectionComplete = (s) => resourceSelection(s, optional, voiceLang, skins).selectionComplete;
 
 /** Why this browser cannot keep the resources (empty ⇒ it can). */
 export function unsupportedReason() {
@@ -125,8 +144,8 @@ export function resourceContext() {
     const reason = unsupportedReason();
     if (reason) return { unsupported: reason }; // no point in asking for a list this browser cannot store
     let res;
+    const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(10000) : undefined;
     try {
-      const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(10000) : undefined;
       // Revalidate the HTTP cache on every page load. On a wire-level 304 the browser supplies the cached JSON body.
       res = await fetch(MANIFEST_URL, { cache: 'no-cache', signal });
     } catch (err) {
@@ -140,7 +159,8 @@ export function resourceContext() {
       return { error: String(err?.message || err) };
     }
     if (!manifest.files.length) return { manifest, empty: true };
-    return { manifest, store: new ResourceStore(manifest) };
+    const packs = validateResourcePacks(manifest.packs);
+    return { manifest, packs, store: new ResourceStore(manifest) };
   })();
   return contextPromise;
 }
@@ -160,10 +180,10 @@ async function ensureWorker() {
  * Turn the preload on or off (idempotent: the settings store fires on every volume change).
  * @param {boolean} enabled
  */
-export async function syncResources(enabled, includeOptional = optional, preloadVoiceLang = voiceLang) {
+export async function syncResources(enabled, includeOptional = optional, preloadVoiceLang = voiceLang, preloadSkins = skins) {
   enabled = !!enabled;
   const nextVoiceLang = normalizePreloadVoiceLang(preloadVoiceLang);
-  const changed = optional !== !!includeOptional || voiceLang !== nextVoiceLang;
+  const changed = optional !== !!includeOptional || voiceLang !== nextVoiceLang || skins !== !!preloadSkins;
   if (enabled === current && !changed) {
     if (!enabled) {
       await ensureWorker().catch((err) => {
@@ -176,11 +196,16 @@ export async function syncResources(enabled, includeOptional = optional, preload
   }
   const revision = ++syncRevision;
   cancelBackgroundCheck?.();
+  const wasEnabled = current;
   current = enabled;
+  if (!enabled || !wasEnabled) manualPaused = false;
   optional = !!includeOptional;
   voiceLang = nextVoiceLang;
-  set({ enabled, optional, voiceLang, ...resourceSelection(state, optional, voiceLang), error: false, message: '' });
+  skins = !!preloadSkins;
+  set({ enabled, optional, voiceLang, skins, manualPaused, ...resourceSelection(state, optional, voiceLang, skins), error: false, message: '' });
   if (!enabled) {
+    resumeAfterCombat = false;
+    cancelOtherTabWatch?.();
     controller?.abort();
     archiveController?.abort();
     await ensureWorker().catch((err) => {
@@ -193,12 +218,51 @@ export async function syncResources(enabled, includeOptional = optional, preload
   if (changed) controller?.abort();
   if (activeRun && controller?.signal.aborted) await activeRun;
   if (revision !== syncRevision || !current) return;
+  if (manualPaused) { set({ phase: 'paused' }); return; }
+  if (combatPaused) {
+    resumeAfterCombat = true;
+    void ensureWorker().catch(err => console.warn('[resources] service worker not registered', err));
+    set({ phase: 'paused' });
+    return;
+  }
   return start();
+}
+
+/** Temporary battle gate: abort bulk lanes, preserve completed writes/indexes, and resume only automatic work. */
+export async function syncResourceCombat(active) {
+  active = !!active;
+  if (active === combatPaused) return;
+  const revision = ++combatRevision;
+  combatPaused = active;
+  set({ combatPaused });
+  if (active) {
+    resumeAfterCombat = current && !manualPaused && !state.error;
+    cancelBackgroundCheck?.();
+    cancelOtherTabWatch?.();
+    controller?.abort();
+    if (current && !state.archive && !state.error) set({ phase: 'paused' });
+    return;
+  }
+  // Cache.put already in flight cannot be cancelled. Await the whole prior run before obtaining a new Web Lock.
+  if (activeRun) await activeRun;
+  if (revision !== combatRevision || combatPaused) return;
+  const resume = resumeAfterCombat;
+  resumeAfterCombat = false;
+  if (resume && current && !manualPaused && !state.error) return start();
 }
 
 /** Continue (or start) the download of an enabled preload. */
 export async function startResources() {
   if (!current) return;
+  manualPaused = false;
+  set({ manualPaused });
+  if (combatPaused) {
+    resumeAfterCombat = true;
+    set({ phase: 'paused' });
+    return;
+  }
+  if (activeRun && controller?.signal.aborted) await activeRun;
+  if (downloadBlocked()) return;
   return start({ verifyCache: true });
 }
 
@@ -218,12 +282,15 @@ async function withDownloadLock(job) {
 
 /** Another tab owns the download: show what is cached and look again when this tab becomes visible. */
 function watchOtherTab(store) {
+  if (downloadBlocked()) { if (current) set({ phase: 'paused' }); return Promise.resolve(); }
+  cancelOtherTabWatch?.();
   if (globalThis.document?.addEventListener) {
     const recheck = () => {
-      if (document.visibilityState !== 'visible' || !current) return;
-      document.removeEventListener('visibilitychange', recheck);
-      void startResources();
+      if (document.visibilityState !== 'visible' || downloadBlocked()) return;
+      cancelOtherTabWatch?.();
+      void start({ verifyCache: true });
     };
+    cancelOtherTabWatch = () => { document.removeEventListener('visibilitychange', recheck); cancelOtherTabWatch = null; };
     document.addEventListener('visibilitychange', recheck);
   }
   return store.status().then((st) => set({
@@ -241,7 +308,7 @@ function scheduleBackgroundCheck() {
   const revision = syncRevision;
   const run = () => {
     cancelBackgroundCheck = null;
-    if (!current || revision !== syncRevision || activeRun || transferPromise) return;
+    if (downloadBlocked() || revision !== syncRevision || activeRun || transferPromise) return;
     void start({ verifyCache: true, background: true }).catch((err) =>
       console.warn('[resources] background check failed', err));
   };
@@ -250,12 +317,17 @@ function scheduleBackgroundCheck() {
 }
 
 function start(options = {}) {
+  if (downloadBlocked()) { if (current) set({ phase: 'paused' }); return Promise.resolve(); }
   if (transferPromise) return transferPromise.catch(() => {});
   if (activeRun) return activeRun;
   cancelBackgroundCheck?.();
   controller = new AbortController();
   const signal = controller.signal;
-  activeRun = startDownload(signal, options).finally(() => { activeRun = null; controller = null; });
+  activeRun = startDownload(signal, options).catch(err => {
+    // A pause can arrive during initial manifest/cache verification, before the inner download catch.
+    if (err?.name === 'AbortError') { set({ phase: 'paused', message: current ? manualMessage() : t('已停止预载。') }); return; }
+    throw err;
+  }).finally(() => { activeRun = null; controller = null; });
   return activeRun;
 }
 
@@ -264,7 +336,7 @@ async function startDownload(signal, { verifyCache = false, background = false }
   const checkStart = performance.now();
   const ctx = await resourceContext();
   const manifestReady = performance.now();
-  if (!current || signal.aborted) { set({ phase: 'paused' }); return; }
+  if (downloadBlocked() || signal.aborted) { set({ phase: 'paused' }); return; }
   if (ctx.error || ctx.unsupported || ctx.empty) {
     const message = ctx.error || ctx.unsupported || t('服务器没有可预载的资源');
     set({ phase: 'error', message, error: true, supported: !ctx.unsupported });
@@ -286,6 +358,7 @@ async function startDownload(signal, { verifyCache = false, background = false }
       const status = await store.status();
       checkAbort(signal);
       await store.reconcileRuntimeIndex(status);
+      checkAbort(signal);
       if (status.complete) await store.prune();
       return { status };
     });
@@ -296,11 +369,11 @@ async function startDownload(signal, { verifyCache = false, background = false }
   }
   console.info('[resources] preload check timings', { manifestMs: manifestReady - checkStart,
     ...before.checkTimings, background, durationMs: performance.now() - checkStart, cached: before.count, files: before.total });
-  if (!current || signal.aborted) { set({ phase: 'paused' }); return; }
+  if (downloadBlocked() || signal.aborted) { set({ phase: 'paused' }); return; }
   const ready = selectionComplete(before);
   set({ ...counters(before), phase: ready ? 'ready' : 'download',
     message: ready ? !verifyCache ? t('已读取本机缓存索引，稍后在后台核对缓存。')
-      : optional ? t('所选资源已齐全。') : t('必备资源已预载完成；可选资源按需加载。') : '' });
+      : optional || skins ? t('所选资源已齐全。') : t('必备资源已预载完成；可选资源按需加载。') : '' });
   if (ready) {
     if (!verifyCache) scheduleBackgroundCheck();
     return;
@@ -316,24 +389,32 @@ async function startDownload(signal, { verifyCache = false, background = false }
     // Required visuals first, then optional audio/tutorials when selected.
     const outcome = await withDownloadLock(async () => {
       checkAbort(signal);
+      await preloadTransportPacks(store, ctx.packs, [TIER_ESSENTIAL], signal, onProgress);
       await store.download({ tiers: [TIER_ESSENTIAL], signal, onProgress });
-      if (optional) await store.download({ tiers: [TIER_REST], signal, onProgress,
-        includeFile: (file) => selectedResourceGroup(resourceGroup(file), true, voiceLang) });
+      checkAbort(signal);
+      if (optional || skins) {
+        const include = (file) => selectedResourceGroup(resourceGroup(file), optional, voiceLang, skins);
+        await preloadTransportPacks(store, ctx.packs, [TIER_REST], signal, onProgress, include);
+        await store.download({ tiers: [TIER_REST], signal, onProgress, includeFile: include });
+      }
       return { busy: false };
     });
     if (outcome.busy) { await watchOtherTab(store); return; }
+    checkAbort(signal);
     const after = await store.status({ verifyCache: true });
+    checkAbort(signal);
     set({
       ...counters(after),
       phase: 'ready',
       error: false,
-      message: !optional && selectionComplete(after) ? t('必备资源已预载完成；可选资源按需加载。') : after.complete
+      message: !optional && !skins && selectionComplete(after) ? t('必备资源已预载完成；可选资源按需加载。') : after.complete
         ? t('资源已全部预载完成（{0}）。', { 0: formatBytes(after.bytes) })
         : selectionComplete(after) ? t('所选资源已齐全。') : t('已保存 {count}/{total} 个文件；未完成的会在下次开启时重试。', { count: after.count, total: after.total }),
     });
   } catch (err) {
     if (err?.name === 'AbortError') {
-      const now = await store.status().catch(() => null);
+      // Do not begin a cache-key scan while the battle is taking over the page.
+      const now = combatPaused ? null : await store.status().catch(() => null);
       set({ ...(now ? counters(now) : {}), phase: 'paused', message: current ? t('已暂停，可继续下载或清理缓存。') : t('已停止预载。') });
       return;
     }
@@ -345,14 +426,47 @@ async function startDownload(signal, { verifyCache = false, background = false }
   }
 }
 
+/** Prefer a category pack for a first fill; small updates remain per-file incremental. */
+async function preloadTransportPacks(store, packs, tiers, signal, onProgress, includeFile = () => true) {
+  if (!Array.isArray(packs) || !packs.length) return;
+  let status = await store.status({ verifyCache: false });
+  const current = new Map(store.files.map((file) => [store.keyOf(file.url), file]));
+  for (const pack of packs) {
+    checkAbort(signal);
+    if (!tiers.includes(pack.tier)) continue;
+    const candidates = pack.files.map((entry) => current.get(store.keyOf(entry.url)))
+      .filter((file) => file && file.tier === pack.tier && includeFile(file));
+    const selectedBytes = candidates.reduce((sum, file) => sum + (file.size || 0), 0);
+    const missingBytes = candidates.reduce((sum, file) => status.present.has(store.keyOf(file.url)) ? sum : sum + (file.size || 0), 0);
+    if (!selectedBytes || missingBytes < selectedBytes * 0.25) continue;
+    try {
+      const response = await fetch(pack.url, { cache: 'no-store', signal });
+      if (!response.ok) throw new Error(`资源分包 HTTP ${response.status}`);
+      const { importResourceZip } = await import('./archive.js');
+      const outcome = await importResourceZip(store, await response.blob(), { signal,
+        onProgress: (progress) => onProgress?.({ ...progress, phase: 'pack', current: pack.id }) });
+      status = await store.status({ verifyCache: false });
+      if (outcome.imported) console.info('[resources] transport pack imported', { id: pack.id, imported: outcome.imported });
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      console.warn('[resources] transport pack unavailable; falling back to file downloads', pack.id, error);
+    }
+  }
+}
+
 /** Stop downloading (keeps what is cached). */
 export function pauseResources() {
+  manualPaused = true;
+  resumeAfterCombat = false;
+  set({ manualPaused });
   cancelBackgroundCheck?.();
+  cancelOtherTabWatch?.();
   archiveController?.abort();
   if (controller) {
     controller.abort();
     set({ message: t('正在暂停…') });
   }
+  else if (current && !state.archive) set({ phase: 'paused', message: manualMessage() });
 }
 
 /** ZIP support stays out of the initial module graph. An import can be started before enabling network preloading. */
@@ -441,7 +555,11 @@ function transferArchive(kind, file) {
  * Delete every cached resource (all versions) and stop.
  */
 export async function clearResources() {
+  manualPaused = true;
+  resumeAfterCombat = false;
+  set({ manualPaused });
   cancelBackgroundCheck?.();
+  cancelOtherTabWatch?.();
   controller?.abort();
   archiveController?.abort();
   if (activeRun) await activeRun;
@@ -472,6 +590,7 @@ export async function clearResources() {
 
 /** Opening the manager checks the cache without starting network asset downloads. */
 export async function inspectResources() {
+  if (combatPaused) { if (current && !state.archive) set({ phase: 'paused' }); return; }
   // An active run already publishes authoritative counters; opening the panel must not enqueue another cache scan.
   if (activeRun || transferPromise) return;
   cancelBackgroundCheck?.();
@@ -485,12 +604,17 @@ export async function inspectResources() {
   }
   try {
     if (activeRun || transferPromise) return;
+    if (combatPaused) { if (current) set({ phase: 'paused' }); return; }
     const outcome = await withDownloadLock(async () => {
+      if (combatPaused) return { deferred: true };
       const status = await ctx.store.status();
+      if (combatPaused) return { deferred: true };
       await ctx.store.reconcileRuntimeIndex(status);
+      if (combatPaused) return { deferred: true };
       if (status.complete) await ctx.store.prune();
       return { status };
     });
+    if (outcome.deferred) { if (current) set({ phase: 'paused' }); return; }
     const status = outcome.busy ? await ctx.store.status() : outcome.status;
     set({ ...counters(status), version: ctx.manifest.version, supported: true,
       ...(!activeRun && !transferPromise ? { phase: selectionComplete(status) ? 'ready' : 'paused', message: '', error: false } : {}) });

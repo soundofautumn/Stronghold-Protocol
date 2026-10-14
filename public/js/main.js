@@ -46,19 +46,21 @@ import { TitleScreen, sanitizeName, returnToTitleAfterNameReview } from './scree
 import { LobbyScreen, rememberRoom, parseRoomParam } from './screens/lobby.js';
 import { RoomScreen } from './screens/room.js';
 import { GameScreen } from './screens/game.js';
-import { installAudio } from './audio.js';
+import { audio, installAudio } from './audio.js';
 import { settingsStore, useSettings, updateSettings } from './ui/settings.js';
 import { ResourceHost } from './ui/resourcePanel.js';
+import { bindResourceCombat } from './resources/combat.js';
 import { GuideHost } from './ui/guide.js';
 import { installDeviceSupport } from './ui/device.js';
 import { LoadoutHost } from './screens/loadout.js';
 import { StatsHost } from './screens/stats.js';
 import { recordResult, installStatsRecorder } from './ui/stats.js';
+import { installSkinsSync } from './ui/skins.js';
 import { installLoadoutSync, installOwnershipSync, installDiySync } from './ui/loadoutSync.js';
 import { startBuildGuard } from './ui/buildGuard.js';
 import { initLang, useLang, tickerText } from './ui/lang.js';
 import { t, N_, translateWire } from '../../shared/i18n.js';
-import { recordError } from './diag.js';
+import { recordError, installTrafficMeter } from './diag.js';
 import { appendChat, validChatText } from '../../shared/chat.js';
 
 const RESTORE_GRACE_MS = 1500;
@@ -254,6 +256,10 @@ function wireNet() {
   });
   net.on('m.public', (msg) => { matchAt = Date.now(); store.patch('match', { public: payload(msg) }); maybeFinishRestore(); });
   net.on('m.private', (msg) => { matchAt = Date.now(); store.patch('match', { private: payload(msg) }); });
+  net.on('m.layer', (msg) => {
+    const s = store.get();
+    if (selectRoute(s) === 'game' && msg.playerId === s.me?.playerId) audio.layerGain(msg.bondId, msg.add);
+  });
   net.on('m.field', (msg) => store.patch('match', { field: payload(msg) }));
   net.on('m.result', (msg) => {
     const res = payload(msg);
@@ -328,7 +334,8 @@ function ScreenCrashed({ error, reset }) {
 
 function ResourceManagerHost() {
   const settings = useSettings();
-  return html`<${ResourceHost} enabled=${settings.preload} optional=${settings.preloadOptional} voiceLang=${settings.preloadVoiceLang}
+  return html`<${ResourceHost} enabled=${settings.preload} optional=${settings.preloadOptional} voiceLang=${settings.preloadVoiceLang} skins=${settings.preloadSkins}
+    onSkins=${(preloadSkins) => updateSettings({ preloadSkins })}
     onVoiceLang=${(preloadVoiceLang) => updateSettings({ preloadVoiceLang })}
     onChange=${(preload) => updateSettings({ preload })} onOptional=${(preloadOptional) => updateSettings({ preloadOptional })} />`;
 }
@@ -387,6 +394,8 @@ function installGlobalErrorHandlers() {
 
 async function boot() {
   installGlobalErrorHandlers();
+  // what this page downloads, by category, for the 问题反馈 report's traffic line (diag.js; nothing is sent anywhere)
+  installTrafficMeter();
   // touch / hover / fullscreen classes, zoom-gesture blocking, rotation re-layout (ui/device.js, css/devices.css)
   installDeviceSupport();
   // A page restored from the back/forward cache has a dead socket and a stale token choice: start over.
@@ -406,6 +415,7 @@ async function boot() {
   wireNet();
   installStatsRecorder(store); // follows the match on screen, so a 放弃模拟 can be recorded (ui/stats.js)
   installLoadoutSync({ net });
+  installSkinsSync({ net, settings: settingsStore });
   installOwnershipSync({ net });
   installDiySync({ net });
   net.attachBrowserHooks();
@@ -456,7 +466,8 @@ async function boot() {
 function installResourcePreload() {
   import('./resources/index.js')
     .then((r) => {
-      const apply = (s) => { r.syncResources(!!s.preload, !!s.preloadOptional, s.preloadVoiceLang).catch((err) => console.warn('[resources] sync failed', err)); };
+      bindResourceCombat(store, r, err => console.warn('[resources] combat sync failed', err));
+      const apply = (s) => { r.syncResources(!!s.preload, !!s.preloadOptional, s.preloadVoiceLang, !!s.preloadSkins).catch((err) => console.warn('[resources] sync failed', err)); };
       apply(settingsStore.get());
       settingsStore.subscribe(apply);
     })

@@ -86,23 +86,24 @@ test('export/import round trip includes only cached files and serves imported by
   assert.equal((await importResourceZip(target.store, exported.blob)).imported, 1, 'a damaged cached copy is replaced by verified package bytes');
 });
 
-test('board JSON metadata and bracket textures preload, round-trip through ZIP and match encoded CDN requests', async () => {
+test('board/scene JSON metadata and bracket textures preload, round-trip through ZIP and match encoded CDN requests', async () => {
   const paths = ['/assets/local/map/fx/materials.json', '/assets/local/map/fx/prefab.json', '/assets/local/map/autochess/tiles.json',
-    '/assets/local/map/fx/[opt]merged_textures.png', '/assets/local/map/water/[ucp]TX_water_normal.png'];
+    '/assets/local/map/fx/[opt]merged_textures.png', '/assets/local/map/water/[ucp]TX_water_normal.png',
+    '/assets/local/scene/act2autochess_m02/scene.json', '/assets/local/scene/act2autochess_m02/scene.bin'];
   const files = paths.map((url) => file(url, url.endsWith('.json') ? '{"board":true}' : 'texture'));
   const source = store(files);
-  assert.equal((await source.store.download({ tiers: [1] })).count, 5);
+  assert.equal((await source.store.download({ tiers: [1] })).count, paths.length);
   const exported = await exportResourceZip(source.store);
-  assert.equal(exported.count, 5);
+  assert.equal(exported.count, paths.length);
   const targetFiles = files.map((f) => ({ ...f, url: 'https://cdn.example/game' + encodeURI(f.url) }));
   const target = store(targetFiles);
-  assert.equal((await importResourceZip(target.store, exported.blob)).imported, 5);
+  assert.equal((await importResourceZip(target.store, exported.blob)).imported, paths.length);
   for (const f of targetFiles) {
     const response = await handleResourceRequest(new Request(f.url), { caches: target.caches });
     assert.equal(await response.text(), f.body);
     if (f.url.endsWith('.json')) assert.match(response.headers.get('content-type'), /application\/json/);
   }
-  assert.equal((await target.store.status()).tier1Present, 5);
+  assert.equal((await target.store.status()).tier1Present, paths.length);
 });
 
 test('legacy ZIP raw bracket paths match new encoded paths; encoded duplicates and unrelated JSON are refused', async () => {
@@ -118,6 +119,32 @@ test('legacy ZIP raw bracket paths match new encoded paths; encoded duplicates a
   for (const url of ['/assets/local/map/fx/other.json', '/assets/game.json', '/data/assets.json', '/i18n/en.json']) {
     await assert.rejects(importResourceZip(target.store, await packageZip([file(url, '{}')])));
   }
+});
+
+test('PNG-to-WebP migration reuses unchanged skeletons from old ZIPs, never relabels PNG bytes', async () => {
+  const skeleton = file('/assets/spine/a.skel', 'unchanged-skeleton');
+  const png = file('/assets/spine/a.png', 'legacy-png');
+  const oldAtlas = file('/assets/spine/a.atlas', 'a.png\nsize: 32,32\n');
+  const webp = file('/assets/spine/a.webp', 'converted-webp');
+  const newAtlas = file('/assets/spine/a.webp.atlas', 'a.webp\nsize: 32,32\n');
+  const optional = file('/assets/audio/bgm/a.mp3', 'music', 2);
+  const files = [skeleton, webp, newAtlas, optional];
+  const target = store(files, { version: 'compressed' });
+  const old = await packageZip([skeleton, png, oldAtlas]);
+  const imported = await importResourceZip(target.store, old);
+  assert.equal(imported.imported, 1);
+  assert.equal(imported.skippedPackage, 2);
+  assert.deepEqual(target.calls, []);
+  const cache = await target.caches.open(CACHE_NAME);
+  await cache.put(target.store.keyOf(png.url), new Response(png.body));
+  await target.store.download({ tiers: [1] });
+  assert.deepEqual(target.calls, [target.store.keyOf(webp.url), target.store.keyOf(newAtlas.url)]);
+  assert.equal(await (await cache.match(target.store.keyOf(png.url))).text(), png.body,
+    'partial selected-scope upgrade must retain old cache until full-set cleanup is safe');
+  assert.equal(await (await cache.match(target.store.keyOf(webp.url))).text(), webp.body);
+  assert.equal((await importResourceZip(target.store, await packageZip([webp, newAtlas], { version: 2 }))).imported, 0);
+  const exported = await exportResourceZip(target.store);
+  assert.equal(exported.count, 3, 'current ZIP excludes legacy PNG and old atlas');
 });
 
 test('old ZIP reuses unchanged files across CDN prefixes, skips stale/removed/unverifiable files, downloads only the remainder', async () => {
