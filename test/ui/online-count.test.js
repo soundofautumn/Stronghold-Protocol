@@ -10,6 +10,11 @@ test('the online-count pill opens a modal list of the online nicknames', async (
   ]);
   assert.match(src, /export function OnlineCount\(\{ online, class: cls \}\)/);
   assert.match(src, /online-count--btn/);
+  // The pill stays a stateless component: the list lives in a store and a host mounted once by UiHosts, so the
+  // topbar tests can keep walking the pill's vnode (test/announcements.test.js).
+  assert.match(src, /export const onlineListUi = createStore\(\{ open: false, run: 0 \}\)/);
+  assert.match(src, /export function OnlineListHost\(\)/);
+  assert.match(src, /<\$\{OnlineListHost\} \/>/);
   assert.match(src, /doFetch\('\/api\/online'/);
   assert.match(src, /t\('在线玩家'\)/);
   assert.match(src, /players\.map\(/);

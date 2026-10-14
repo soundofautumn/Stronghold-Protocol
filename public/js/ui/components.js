@@ -3,7 +3,8 @@
 // Exports: html (bound htm), Icon, Button, Panel, MicroLabel, Chevrons, HexBadge, TierChip,
 // BondDisc, SevenSeg, Countdown, Modal, confirmDialog/alertDialog + DialogHost, Tooltip +
 // TooltipLayer, ProgressBar, Tabs, Spinner, AvatarFrame, PhaseBanner, ResultDialog, PingPill, DifficultyTag,
-// DifficultyIcon, TextField, UiHosts (mount once: dialogs + tooltips), useTicker, secondsLeft/hasDeadline,
+// DifficultyIcon, TextField, UiHosts (mount once: dialogs + tooltips + the online list), OnlineCount +
+// OnlineListHost, useTicker, secondsLeft/hasDeadline,
 // roman(), doctorNo().
 //
 // Look: research 06 §11–§12 — near-black green-grey panels, 1px lines, mint accents, bracket
@@ -16,7 +17,7 @@ import { useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } fro
 import htm from '../../vendor/htm.module.js';
 import { DIFFICULTY_NAMES, DIFFICULTY_COLORS } from '../../../shared/constants.js';
 import { t } from '../../../shared/i18n.js';
-import { serverNow } from '../store.js';
+import { createStore, serverNow, useStore } from '../store.js';
 import { data, useData, localAsset } from '../data.js';
 import { uiUrl } from './assetUrls.js';
 
@@ -850,50 +851,59 @@ export function PingPill({ ms, online = true, class: cls }) {
 
 /**
  * Live authenticated-player count delivered by the WebSocket presence stream.
- * The pill is a button: clicking it loads `GET /api/online` (docs/CUSTOM_API.md) and shows the online nicknames.
+ * The pill is a button: clicking it opens the online list (`GET /api/online`, docs/CUSTOM_API.md). The list itself
+ * lives in a store plus `<OnlineListHost/>` (mounted once by UiHosts) so the pill stays a stateless component and
+ * can be rendered on its own, exactly like `<AnnouncementButton/>`.
  */
 export function OnlineCount({ online, class: cls }) {
   const value = Number.isInteger(online) && online >= 0 ? online : '--';
-  const [open, setOpen] = useState(false);
+  return html`<button type="button" class=${cx('ping', 'online-count', 'online-count--btn', cls)} title=${t('当前在线人数')}
+      aria-haspopup="dialog" onClick=${openOnlineList}>
+    <${Icon} name="users" class="ping__icon" />
+    <span class="ping__value num">${value}</span><span class="ping__unit">${t('在线')}</span>
+  </button>`;
+}
+
+/** The open state of the online list; `run` bumps on every open/retry so the host reloads exactly once per request. */
+export const onlineListUi = createStore({ open: false, run: 0 });
+export const closeOnlineList = () => onlineListUi.set({ open: false });
+export function openOnlineList() { onlineListUi.set((s) => ({ open: true, run: s.run + 1 })); }
+
+/** The online player list dialog (昵称来自 /api/online). Mount once — UiHosts does. */
+export function OnlineListHost() {
+  const open = useStore((s) => s.open, Object.is, onlineListUi);
+  const run = useStore((s) => s.run, Object.is, onlineListUi);
+  const online = useStore((s) => s.presence.online);
   const [players, setPlayers] = useState(null); // null: 还没加载/正在加载
   const [failed, setFailed] = useState(false);
-  const load = () => {
+  useEffect(() => {
+    if (!open) return undefined;
     setFailed(false);
     setPlayers(null);
     const doFetch = globalThis.fetch;
-    if (typeof doFetch !== 'function') { setFailed(true); return; }
+    if (typeof doFetch !== 'function') { setFailed(true); return undefined; }
+    let live = true; // a close (or a newer request) must not write the previous answer over the list
     doFetch('/api/online', { headers: { accept: 'application/json' } })
       .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
-      .then((body) => setPlayers(Array.isArray(body?.players) ? body.players : []))
-      .catch(() => { setFailed(true); setPlayers([]); });
-  };
-  const toggle = () => {
-    const next = !open;
-    setOpen(next);
-    if (next) load();
-  };
-  return html`<${Fragment}>
-    <button type="button" class=${cx('ping', 'online-count', 'online-count--btn', cls)} title=${t('当前在线人数')}
-            aria-haspopup="dialog" aria-expanded=${open ? 'true' : 'false'} onClick=${toggle}>
-      <${Icon} name="users" class="ping__icon" />
-      <span class="ping__value num">${value}</span><span class="ping__unit">${t('在线')}</span>
-    </button>
-    <${Modal} open=${open} title=${t('在线玩家')} width="min(92vw, 460px)"
-             micro=${Number.isInteger(online) && online >= 0 ? t('共 {n} 人', { n: online }) : ''}
-             onClose=${() => setOpen(false)}
-             actions=${html`<${Button} variant="secondary" onClick=${() => setOpen(false)}>${t('关闭')}<//>`}>
-      ${failed
-        ? html`<p class="online-list__hint">${t('读取失败，请稍后重试。')}</p>
-            <${Button} variant="secondary" size="sm" onClick=${load}>${t('重试')}<//>`
-        : players === null
-          ? html`<p class="online-list__hint"><${Spinner} size="sm" />${t('读取中…')}</p>`
-          : players.length === 0
-            ? html`<p class="online-list__hint">${t('暂无在线玩家。')}</p>`
-            : html`<ul class="online-list">${players.map((name, i) => html`<li class="online-list__item" key=${`${i}:${String(name)}`}>
-                <span class="online-list__num num">${i + 1}</span><span class="online-list__name">${name}</span>
-              </li>`)}</ul>`}
-    </${Modal}>
-  </${Fragment}>`;
+      .then((body) => { if (live) setPlayers(Array.isArray(body?.players) ? body.players : []); })
+      .catch(() => { if (live) { setFailed(true); setPlayers([]); } });
+    return () => { live = false; };
+  }, [open, run]);
+  return html`<${Modal} open=${open} title=${t('在线玩家')} width="min(92vw, 460px)"
+      micro=${Number.isInteger(online) && online >= 0 ? t('共 {n} 人', { n: online }) : ''}
+      onClose=${closeOnlineList}
+      actions=${html`<${Button} variant="secondary" onClick=${closeOnlineList}>${t('关闭')}<//>`}>
+    ${failed
+      ? html`<p class="online-list__hint">${t('读取失败，请稍后重试。')}</p>
+          <${Button} variant="secondary" size="sm" onClick=${openOnlineList}>${t('重试')}<//>`
+      : players === null
+        ? html`<p class="online-list__hint"><${Spinner} size="sm" />${t('读取中…')}</p>`
+        : players.length === 0
+          ? html`<p class="online-list__hint">${t('暂无在线玩家。')}</p>`
+          : html`<ul class="online-list">${players.map((name, i) => html`<li class="online-list__item" key=${`${i}:${String(name)}`}>
+              <span class="online-list__num num">${i + 1}</span><span class="online-list__name">${name}</span>
+            </li>`)}</ul>`}
+  </${Modal}>`;
 }
 
 /**
@@ -966,5 +976,5 @@ export function TextField({ label, micro, value, onInput, onEnter, placeholder, 
 
 /** Global overlay hosts for imperative dialogs and tooltips. Mount once near the root. */
 export function UiHosts() {
-  return html`<${Fragment}><${DialogHost} /><${TooltipLayer} /><//>`;
+  return html`<${Fragment}><${DialogHost} /><${TooltipLayer} /><${OnlineListHost} /><//>`;
 }

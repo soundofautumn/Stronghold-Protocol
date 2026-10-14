@@ -138,6 +138,7 @@
 - 完整 Match Worker 的有效下行消息仅传类型和编码，不重复复制完整消息对象；主线程按需为旧回调解码，状态增量仍从编码建立独立快照，不能信任回调可变对象作为基线。原始 capture 在 Match Worker 内序列化为独占字节缓冲，主线程只转交所有权，由持久化 Worker 解码并执行原 `encodeMatchCapture`；保持 Maps、波次隐藏排期、检查点代际、失败保留及旧对象路径，IPC 字节格式不写入 Redis、不作为跨版本存档。验证 `test/encoded-message.test.js`、持久化/生命周期及真实 Redis 重启测试。
 
 - 在线人数 `presence` 每 10 秒最低优先级刷新，人数不变仍可更新；`welcome.online` 即时提供。周期任务独立延后、分批处理，只保留最新待发快照，普通广播/心跳优先；连接已有任何发送积压时跳过本轮，下一周期再更新，不排队补发。不改变游戏状态/回复的可靠 FIFO、背压或压缩参数；已进入 WS/TCP 的字节无法抢占。关停时取消周期及待发任务，保留标题页未认证连接的周期在线人数展示。验证 `test/presence.test.js`、`test/ws-latency.test.js`。
+- 在线玩家列表：`GET /api/online` 只读返回昵称（按 `playerId` 去重、只算连接仍属于该 socket 的会话、按昵称排序），`total` 为真实人数、`players` 超 200 截断，独立令牌桶 1 次/秒、突发 5，带 `X-Robots-Tag: noindex`，不返回会话 ID、令牌、房间或对局数据。大厅及房间的在线人数胶囊是按钮，点击打开在线玩家弹窗（读取中 / 暂无在线玩家 / 读取失败可重试）；胶囊本身保持无状态组件，列表状态在 `onlineListUi` store 与 `OnlineListHost`（`UiHosts` 挂载一次），文案在 en / ja / ko / zh-TW 四个语言包，验证 `test/public-api.test.js`、`test/ui/online-count.test.js`。
 
 - 状态增量通过 `hello.stateDelta: 1` 协商，仅用于 `m.public` / `m.private`；旧客户端保持原全量消息。新连接、重连及 `state.resync` 发送全量，补丁按 `base` 校验独立公共/私人基线，失败不派发部分状态，重同步限流后安静重试。基线仅在可靠帧成功入队后推进，不丢弃补丁、不改变确认时机；原全量结果回放仍可用，私人状态不跨玩家共享。源码 build 标识纳入 `shared/stateDelta.js`，生产随 Vite 网络模块打包。保留 `test/state-delta.test.js`、`test/state-delta-integration.test.js`；详见 `docs/STATE_DELTA.md`。性能验收看关联状态完成解码后的 p95 和失败率，按实际四人房间发送，不将全员合成广播视为完整对局容量；状态视图仍完整生成，不能声称已实现细粒度脏标记或压缩正文复用。
 
