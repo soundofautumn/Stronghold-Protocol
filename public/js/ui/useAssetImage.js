@@ -25,7 +25,24 @@ export function useAssetImage(source) {
     };
   }, [source, failed, revision]);
   return {
-    src: recovered?.source === source ? recovered.url : failed === source ? null : source,
+    src: assetImageSrc(source, failed, recovered),
     onError: () => { setRecovered(null); setFailed(source); },
   };
+}
+
+/**
+ * The `src` of one render step: the recovered object URL, `null` once this source failed, else the source itself.
+ *
+ * `recovered` must be tested as an object, not with optional chaining: an absent `source` (an `<AvatarFrame/>`
+ * without `src`, a chip whose manifest entry is missing) is `undefined`, and `recovered?.source === source` compares
+ * undefined to undefined, reads `recovered.url` on null and takes the whole screen down (weak-network update regression).
+ *
+ * @param {string|null|undefined} source
+ * @param {string|null} failed the source whose `<img>` failed, if any
+ * @param {{ source: string, url: string }|null} recovered the blob URL recovered for a failed source, if any
+ * @returns {string|null|undefined}
+ */
+export function assetImageSrc(source, failed, recovered) {
+  if (recovered && recovered.source === source) return recovered.url;
+  return failed === source ? null : source;
 }
