@@ -145,6 +145,24 @@ running; 暂停下载 stops them and 关闭预载 disables automatic downloading
   to the download's real-cache inspection rather than assuming completeness. No startup/check path hashes or reads
   asset bodies. Full scans read cache keys and both metadata indexes in parallel; only in-flight checks of the same
   mode are coalesced, with independent status snapshots. Active runs publish their counters to the manager.
+- Deployment-generated transport packs (`data/resource-packs.json` plus `public/resource-packs/`) are an optional first-fill
+  optimization. At most two ZIP requests run concurrently. The browser parses stored entries from each response stream as
+  bytes arrive, shows aggregate download progress/speed plus cache-import progress, and lets the next package download
+  overlap the preceding package's cache import. It authenticates the complete ZIP once against the pack index's full
+  SHA-1, then checks the embedded manifest and each selected entry's URL, size and hash metadata against the index/current
+  resource manifest. Trusted transport-pack payloads are not rehashed or CRC-checked per file; unselected payload bytes
+  are consumed for the whole-package digest but not retained. This exception is only for server-indexed deployment packs.
+  Manually imported/general ZIP files still receive the normal per-entry CRC, size and content-digest checks. Missing,
+  invalid or mismatched transport packs fall back to the ordinary per-file fetch path.
+- **Weak-network runtime art recovery.** Battle-time images, Spine files and official board sidecars use a shared
+  request transport (`public/js/resourceNetwork.js`): identical URLs are coalesced, visible critical art is prioritized,
+  runtime transfers are limited to four (two on `2g`/`3g`), transient HTTP failures retry with 1/3/8/20-second
+  jittered backoff, and permanent 404s are not retried. A transfer must receive bytes within 30 seconds and finish
+  within 180 seconds; receiving bytes resets only the idle deadline. The response stream is consumed once and is then
+  decoded by the existing image/Pixi pipeline. A timeout aborts the old request before retrying, so it cannot duplicate
+  a still-hung download. Failed art remains a placeholder rather than blocking the battle; `online`/visible recovery
+  retries failed images and board packs, while a healthy pending Spine request remains shared. Preload and manual ZIP
+  integrity paths are not routed through this transport.
   Runtime writes record a URL only after Cache.put succeeds; their separate index cannot overwrite the preload/ZIP
   hash index. Shared runtime resource locks and exclusive download/clear/repair locks prevent cleanup races; runtime
   index updates are serialized separately. Runtime registrations are deduplicated and coalesced: each batch flushes
@@ -260,9 +278,9 @@ running; 暂停下载 stops them and 关闭预载 disables automatic downloading
 
 ### 离线分析与制作增量资源 ZIP
 
-For dual-format PNG/WebP compression, retained legacy URLs, static Brotli/gzip siblings and old-cache/ZIP
-migration, see [ASSET_SHRINK.md](ASSET_SHRINK.md). It operates on a private candidate, not live files; generated
-art/hashes never enter source commits. Its default conversion does not include optional audio re-encoding.
+Deployment ZIP transport packs are documented in [RESOURCE_PACKS.md](RESOURCE_PACKS.md).
+Main no longer ships the optional asset shrink/conversion tool; existing WebP/atlas and HTTP precompression
+read compatibility remains. Generated art/hashes never enter source commits.
 
 `tools/resource_delta.py` 使用 Python 3.10+ 标准库，对比两个由资源管理窗口导出的 ZIP，
 无需安装依赖，也不将素材解压到磁盘。例如在仓库根目录运行：
@@ -449,15 +467,11 @@ The `stem` of a Spine model is the upstream file name. Two examples: `char_107_l
 - **Fonts:** OTF/TTF files are converted to WOFF2 by a built-in encoder (`tools/assets/woff2.mjs`: Brotli with null transforms).
   - Its output was verified lossless against Google's reference `woff2` decoder.
   - `fonts.css` lists WOFF2 first and falls back to the original file.
-- The default fetch pipeline still produces PNG. Optional offline compression now uses Pillow in
-  `tools/shrink-assets.py`: ordinary color art quality 95, tutorial art quality 90, Spine/data maps lossless;
-  both emote trees remain PNG. It keeps original files and selects verified WebP/`.webp.atlas` siblings through
-  matching manifests. See [ASSET_SHRINK.md](ASSET_SHRINK.md) for candidate-only conversion and legacy cache/ZIP
-  migration. The local extractor remains a separate upstream pipeline: `extract.py --webp` produces board/guide
-  copies without the client (board color q95, normal/data maps lossless, local guide q90), and keeps PNGs for
-  `tools/crop-board-atlas.mjs`. Scene lightmaps from older extraction may still be lossy until the optional
-  candidate conversion regenerates them from their retained PNGs. Do not infer codec policy merely from a sibling's
-  presence or manually reuse the original PNG fingerprint.
+- The default fetch pipeline still produces PNG. The optional branch-wide shrink converter has been removed
+  from main. Existing WebP/explicit `.webp.atlas` manifests and raw PNG/atlas URLs remain readable for deployed assets.
+  The upstream local extractor is unchanged: `extract.py --webp` produces board/guide copies without the client
+  (board color q95, normal/data maps lossless, local guide q90), and keeps PNGs for `tools/crop-board-atlas.mjs`.
+  Do not manually reuse a PNG fingerprint for different WebP bytes.
 
 ## Manifest schema (`data/assets.json`)
 
