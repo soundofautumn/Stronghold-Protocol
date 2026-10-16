@@ -26,13 +26,22 @@ def digest(data):
     return hashlib.sha1(data).hexdigest()
 
 
+def write_stored(archive, name, data):
+    """Stable ZIP metadata: packaging time, host OS and umask are not content."""
+    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.create_system = 3
+    info.external_attr = 0o100644 << 16
+    info.compress_type = zipfile.ZIP_STORED
+    archive.writestr(info, data)
+
+
 def canonical(url):
     if not isinstance(url, str) or not re.match(r"^/((assets|fonts)/)", url):
         raise ValueError(f"invalid resource URL: {url}")
     if any(part in (".", "..", "") for part in url.split("/")[1:-1]):
         raise ValueError(f"unsafe resource URL: {url}")
     suffix = url.rsplit(".", 1)[-1].lower()
-    board_json = re.match(r"^/assets/local/(?:map/.+|scene/(?:act1autochess_m0[1-7]|act2autochess_m0[1-4]))/[^/]+\.json$", url)
+    board_json = re.match(r"^/assets/local/(?:map/(?:fx/(?:materials|prefab)|autochess/(?:materials|tiles))|fx/(?:index|textures|(?:prefabs|mesh)/[A-Za-z0-9_.-]+)|scene/(?:act1autochess_m0[1-7]|act2autochess_m0[1-4])/scene)\.json$", url)
     if suffix not in EXTENSIONS and not board_json:
         raise ValueError(f"unsupported resource URL: {url}")
     return url.replace("[", "%5B").replace("]", "%5D")
@@ -41,7 +50,9 @@ def canonical(url):
 def group(row):
     path = row["url"]
     if row["tier"] == 2:
-        for key in ("voice/cn", "voice/jp", "voice", "sfx", "bgm"):
+        if "/assets/local/fx/" in path:
+            return "fx"
+        for key in ("voice/cn", "voice/jp", "voice/en", "voice/kr", "voice", "sfx", "bgm"):
             if f"/audio/{key}/" in path:
                 return key.replace("/", "_")
         return "other"
@@ -110,12 +121,15 @@ def main():
         for number, chunk in enumerate(chunks, 1):
             pack_id = f"{key}-{number:02d}"
             rows = make_rows(chunk)
-            manifest = {"format": RESOURCE_FORMAT, "version": 2, "resourceVersion": source["version"], "files": rows}
+            # This informational version describes only this package. Embedding
+            # the global manifest version invalidated every ZIP after any update.
+            version = digest(json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))[:12]
+            manifest = {"format": RESOURCE_FORMAT, "version": 2, "resourceVersion": version, "files": rows}
             temporary = args.output / f".{pack_id}.zip.tmp"
             with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
                 for row, original in zip(rows, chunk):
-                    archive.writestr(row["path"], original["data"])
-                archive.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, separators=(",", ":")))
+                    write_stored(archive, row["path"], original["data"])
+                write_stored(archive, MANIFEST, json.dumps(manifest, ensure_ascii=False, separators=(",", ":")))
             if temporary.stat().st_size > args.max_bytes:
                 temporary.unlink()
                 raise SystemExit(f"pack exceeds limit: {temporary}")

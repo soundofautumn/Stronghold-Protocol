@@ -42,7 +42,7 @@ const state = {
   archiveGroup: '',
   packProgress: null,
   optional: false,
-  voiceLang: 'cn',
+  voiceLang: ['cn'],
   skins: false,
   selectionComplete: false,
   combatPaused: false,
@@ -58,7 +58,7 @@ let activeRun = null;
 let transferPromise = null;
 let archiveController = null;
 let optional = false;
-let voiceLang = 'cn';
+let voiceLang = ['cn'];
 let skins = false;
 let syncRevision = 0;
 let workerPromise = null;
@@ -68,6 +68,7 @@ let manualPaused = false;
 let combatRevision = 0;
 let resumeAfterCombat = false;
 let cancelOtherTabWatch = null;
+let runRevision = 0;
 
 const combatMessage = () => t('战斗中已暂停批量预载，战斗结束后自动继续。');
 const manualMessage = () => t('已暂停，可继续下载或清理缓存。');
@@ -81,7 +82,7 @@ export function subscribeResources(fn) {
 
 /** A copy of the current preload state (safe to hand to Preact). */
 export function resourceState() {
-  return { ...state };
+  return { ...state, voiceLang: [...state.voiceLang] };
 }
 
 function set(patch) {
@@ -184,7 +185,7 @@ async function ensureWorker() {
 export async function syncResources(enabled, includeOptional = optional, preloadVoiceLang = voiceLang, preloadSkins = skins) {
   enabled = !!enabled;
   const nextVoiceLang = normalizePreloadVoiceLang(preloadVoiceLang);
-  const changed = optional !== !!includeOptional || voiceLang !== nextVoiceLang || skins !== !!preloadSkins;
+  const changed = optional !== !!includeOptional || voiceLang.join(',') !== nextVoiceLang.join(',') || skins !== !!preloadSkins;
   if (enabled === current && !changed) {
     if (!enabled) {
       await ensureWorker().catch((err) => {
@@ -262,7 +263,8 @@ export async function startResources() {
     set({ phase: 'paused' });
     return;
   }
-  if (activeRun && controller?.signal.aborted) await activeRun;
+  if (transferPromise) await transferPromise.catch(() => {});
+  if (activeRun && (controller?.signal.aborted || ['ready', 'error', 'paused'].includes(state.phase))) await activeRun;
   if (downloadBlocked()) return;
   return start({ verifyCache: true });
 }
@@ -318,9 +320,14 @@ function scheduleBackgroundCheck() {
 }
 
 function start(options = {}) {
-  if (downloadBlocked()) { if (current) set({ phase: 'paused' }); return Promise.resolve(); }
+  if (downloadBlocked()) {
+    if (current && manualPaused) set({ phase: 'paused', message: manualMessage() });
+    else if (current && combatPaused) set({ phase: 'paused', message: combatMessage() });
+    return Promise.resolve();
+  }
   if (transferPromise) return transferPromise.catch(() => {});
   if (activeRun) return activeRun;
+  runRevision++;
   cancelBackgroundCheck?.();
   controller = new AbortController();
   const signal = controller.signal;
@@ -396,16 +403,20 @@ async function startDownload(signal, { verifyCache = false, background = false }
     set({ ...counters(p), phase: 'download', failed: p.failed, error: false, message });
   };
   try {
-    // Required visuals first, then optional audio/tutorials when selected.
+    let failed = 0;
+    // All selected packs first, then per-file gaps in essential-first order.
     const outcome = await withDownloadLock(async () => {
       checkAbort(signal);
-      await preloadTransportPacks(store, ctx.packs, [TIER_ESSENTIAL], signal, onProgress);
-      await store.download({ tiers: [TIER_ESSENTIAL], signal, onProgress });
+      const include = (file) => file.tier === TIER_ESSENTIAL
+        || ((optional || skins) && selectedResourceGroup(resourceGroup(file), optional, voiceLang, skins));
+      // Build all selected transport plans before the per-file fallback. This
+      // prevents a slow essential-file lane from delaying the skin packs.
+      const packTiers = optional || skins ? [TIER_ESSENTIAL, TIER_REST] : [TIER_ESSENTIAL];
+      await preloadTransportPacks(store, ctx.packs, packTiers, signal, onProgress, include);
+      failed += (await store.download({ tiers: [TIER_ESSENTIAL], signal, onProgress })).failed;
       checkAbort(signal);
       if (optional || skins) {
-        const include = (file) => selectedResourceGroup(resourceGroup(file), optional, voiceLang, skins);
-        await preloadTransportPacks(store, ctx.packs, [TIER_REST], signal, onProgress, include);
-        await store.download({ tiers: [TIER_REST], signal, onProgress, includeFile: include });
+        failed += (await store.download({ tiers: [TIER_REST], signal, onProgress, includeFile: include })).failed;
       }
       return { busy: false };
     });
@@ -415,8 +426,9 @@ async function startDownload(signal, { verifyCache = false, background = false }
     checkAbort(signal);
     set({
       ...counters(after),
-      phase: 'ready',
-      error: false,
+      phase: selectionComplete(after) ? 'ready' : 'error',
+      failed,
+      error: !selectionComplete(after),
       message: !optional && !skins && selectionComplete(after) ? t('必备资源已预载完成；可选资源按需加载。') : after.complete
         ? t('资源已全部预载完成（{0}）。', { 0: formatBytes(after.bytes) })
         : selectionComplete(after) ? t('所选资源已齐全。') : t('已保存 {count}/{total} 个文件；未完成的会在下次开启时重试。', { count: after.count, total: after.total }),
@@ -456,7 +468,7 @@ async function preloadTransportPacks(store, packs, tiers, signal, onProgress, in
   }
   if (!plans.length) return;
 
-  const { readTransportPack, resourcePath } = await import('./archive.js');
+  const [{ fetchTransportPack }, { resourcePath }] = await Promise.all([import('./transport.js'), import('./archive.js')]);
   const controller = new AbortController();
   const abort = () => controller.abort(signal.reason);
   if (signal.aborted) abort();
@@ -467,15 +479,16 @@ async function preloadTransportPacks(store, packs, tiers, signal, onProgress, in
   let importing = null;
   let lastSpeedAt = performance.now();
   let lastSpeedBytes = 0;
+  let transferredBytes = 0;
   let speedBytesPerSecond = 0;
   const publish = (status = null) => {
     const loaded = [...loadedByPack.values()].reduce((sum, value) => sum + value, 0);
     const now = performance.now();
     const elapsed = now - lastSpeedAt;
     if (elapsed >= 250) {
-      speedBytesPerSecond = Math.max(0, (loaded - lastSpeedBytes) * 1000 / elapsed);
+      speedBytesPerSecond = Math.max(0, (transferredBytes - lastSpeedBytes) * 1000 / elapsed);
       lastSpeedAt = now;
-      lastSpeedBytes = loaded;
+      lastSpeedBytes = transferredBytes;
     }
     onProgress?.({ phase: 'transport', status, progress: { downloadedBytes: loaded, totalBytes,
       speedBytesPerSecond, activeDownloads, importing } });
@@ -521,12 +534,13 @@ async function preloadTransportPacks(store, packs, tiers, signal, onProgress, in
       activeDownloads++;
       publish();
       try {
-        const response = await fetch(pack.url, { cache: 'no-store', signal: controller.signal });
-        if (!response.ok) throw new Error(`资源分包 HTTP ${response.status}`);
         const selectedPaths = new Set(candidates.map((file) => resourcePath(file.url)));
-        const payload = await readTransportPack(response, pack, { signal: controller.signal,
+        let previousLoaded = 0;
+        const payload = await fetchTransportPack(pack, { signal: controller.signal,
           selectedPaths,
           onProgress: (loaded) => {
+            transferredBytes += Math.max(0, loaded - previousLoaded);
+            previousLoaded = loaded;
             loadedByPack.set(pack.id, loaded);
             publish();
           } });
@@ -674,7 +688,7 @@ function transferArchive(kind, file) {
     if (outcome.busy) throw new Error('另一个标签页正在处理资源，请暂停后重试');
     checkAbort(signal);
     const status = await ctx.store.status();
-    const missing = resourceSelection(status, optional, voiceLang).selectedMissing;
+    const missing = resourceSelection(status, optional, voiceLang, skins).selectedMissing;
     set({ ...counters(status), failed: 0, phase: selectionComplete(status) ? 'ready' : 'paused',
       message: kind === 'export'
         ? t('已导出 {count} 个资源文件。', { count: outcome.count })
@@ -734,7 +748,7 @@ export async function clearResources() {
     phase: current ? 'paused' : 'off',
     message: t('已清理预载资源缓存。'),
     selectionComplete: false,
-    ...resourceSelection({ groups: state.groups.map((g) => ({ ...g, present: 0, bytes: 0 })) }, optional, voiceLang),
+    ...resourceSelection({ groups: state.groups.map((g) => ({ ...g, present: 0, bytes: 0 })) }, optional, voiceLang, skins),
   });
 }
 
@@ -743,6 +757,7 @@ export async function inspectResources() {
   if (combatPaused) { if (current && !state.archive) set({ phase: 'paused' }); return; }
   // An active run already publishes authoritative counters; opening the panel must not enqueue another cache scan.
   if (activeRun || transferPromise) return;
+  const revision = runRevision;
   cancelBackgroundCheck?.();
   if (!activeRun && !transferPromise) set({ phase: 'checking', error: false, message: t('正在检查已保存的资源…') });
   const ctx = await resourceContext();
@@ -766,9 +781,13 @@ export async function inspectResources() {
     });
     if (outcome.deferred) { if (current) set({ phase: 'paused' }); return; }
     const status = outcome.busy ? await ctx.store.status() : outcome.status;
+    // An inspection begun before a download must never overwrite the newer
+    // completed/failed run with its older "paused" snapshot.
+    if (revision !== runRevision) return;
     set({ ...counters(status), version: ctx.manifest.version, supported: true,
       ...(!activeRun && !transferPromise ? { phase: selectionComplete(status) ? 'ready' : 'paused', message: '', error: false } : {}) });
   } catch (err) {
+    if (revision !== runRevision) return;
     set({ phase: 'error', error: true, message: t('无法读取本机资源缓存：{0}', { 0: err?.message || err }) });
   }
 }

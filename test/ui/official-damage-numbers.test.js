@@ -26,7 +26,8 @@ test('the settings screen, the field view and the simplified board follow the sa
   assert.match(settings, /officialDamageNumbers/);
   const app = read('public/js/render/app.js');
   assert.match(app, /officialDamageNumbers/);
-  assert.match(app, /fx\.damage\(v, amt, e\[3\], src, e\[4\]\)/);
+  // (an official hit drawn by the official battle effects passes NO_SPARK as well: render/vfx/wiring.js damage)
+  assert.match(app, /fx\.damage\(v, amt, e\[3\], src, e\[4\](, official \? NO_SPARK : undefined)?\)/);
   assert.deepEqual(fallbackFloat(['dmg', 7, 40, 'phys'], { damageNumbers: true }), { id: 7, text: '40', type: 'phys' });
   assert.deepEqual(fallbackFloat(['heal', 7, 12], { damageNumbers: true, officialDamageNumbers: false }), { id: 7, text: '+12', type: 'heal' });
   assert.equal(fallbackFloat(['dmg', 7, 40, 'phys'], { damageNumbers: true, officialDamageNumbers: true }), null);
@@ -58,4 +59,14 @@ test('the title page excludes the upstream footer link while retaining server-ab
   assert.match(src, /target="_blank"/);
   assert.match(src, /rel="noopener noreferrer"/);
   for (const lang of ['en', 'ja', 'ko', 'zh-TW']) assert.equal(JSON.parse(read(`public/i18n/${lang}.json`))['项目仓库'], undefined);
+});
+
+test('server-about credits the UI creator with the requested Bilibili profile', () => {
+  const src = read('public/js/screens/title.js');
+  const about = src.slice(src.indexOf('<dl class="title-about__links">'), src.indexOf('</dl>'));
+  assert.match(about, /t\('UI 制作'\)/);
+  assert.match(about, /href="https:\/\/space\.bilibili\.com\/27675079" target="_blank" rel="noopener noreferrer">B站雨千代Chiyo<\/a>/);
+  for (const lang of ['en', 'ja', 'ko', 'zh-TW']) {
+    assert.ok(JSON.parse(read(`public/i18n/${lang}.json`))['UI 制作'], lang);
+  }
 });

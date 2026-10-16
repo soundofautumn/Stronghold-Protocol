@@ -1,5 +1,8 @@
 import { N_ } from '../../../shared/i18n.js';
 import { canonicalResourceUrl, isBoardResourceJson } from '../../../shared/resourcePaths.js';
+import { isResourcePackUrl } from '../../../shared/resourcePackRoutes.js';
+import { dataUrl } from '../../../shared/cdn.js';
+import { DATA_CDN } from '../asset-cdn.js';
 // public/js/resources/common.js — shared pieces of the optional asset preload (docs/ASSETS.md「Preload」).
 //
 // No DOM and no Preact: the page (store.js / index.js), the Service Worker (service.js) and the Node tests all import
@@ -21,10 +24,10 @@ export const RESOURCES_FORMAT = 1;
 export const MAX_FILE_BYTES = 24 * 1024 * 1024;
 /** Required visuals: maps, portraits, Spine, fonts, UI and icons. */
 export const TIER_ESSENTIAL = 1;
-/** Optional: voices, sound effects, music and tutorial illustrations. */
+/** Optional: voices, official battle effects, sound effects, music and tutorial illustrations. */
 export const TIER_REST = 2;
-export const MANIFEST_URL = '/data/resource-manifest.json';
-export const PACK_MANIFEST_URL = '/data/resource-packs.json';
+export const MANIFEST_URL = dataUrl('/data/resource-manifest.json', DATA_CDN);
+export const PACK_MANIFEST_URL = dataUrl('/data/resource-packs.json', DATA_CDN);
 export const SW_URL = '/resource-sw.js';
 /** A pack is a transport optimization, never a cache identity or a second hash authority. */
 export const RESOURCE_PACK_MAX_BYTES = 16_000_000;
@@ -36,7 +39,10 @@ export const RESOURCE_GROUPS = Object.freeze({
   ui: { name: N_('界面、图标与字体'), tier: TIER_ESSENTIAL },
   voice_cn: { name: N_('中文语音'), tier: TIER_REST },
   voice_jp: { name: N_('日语语音'), tier: TIER_REST },
+  voice_en: { name: N_('英语语音'), tier: TIER_REST },
+  voice_kr: { name: N_('韩语语音'), tier: TIER_REST },
   voice: { name: N_('其他角色语音'), tier: TIER_REST },
+  fx: { name: N_('官方特效'), tier: TIER_REST },
   sfx: { name: N_('音效'), tier: TIER_REST },
   music: { name: N_('背景音乐'), tier: TIER_REST },
   skins: { name: N_('干员皮肤'), tier: TIER_REST },
@@ -47,10 +53,13 @@ export function resourceGroup(file) {
   const path = new URL(file.url, 'https://resources.invalid').pathname;
   if (file.tier === TIER_REST) {
     // Skin model stems contain an outfit directory; handle a CDN prefix too.
-    if (/\/char\/avatar\/skin\//.test(path) || /\/spine\/op\/[^/]+\/[^/]+\/(?:front|back)\//.test(path)) return 'skins';
+    if (/\/char\/(?:avatar|portrait)\/skin\//.test(path) || /\/spine\/op\/[^/]+\/[^/]+\/(?:front|back)\//.test(path)) return 'skins';
     if (/\/voice\/cn\//.test(path)) return 'voice_cn';
     if (/\/voice\/jp\//.test(path)) return 'voice_jp';
+    if (/\/voice\/en\//.test(path)) return 'voice_en';
+    if (/\/voice\/kr\//.test(path)) return 'voice_kr';
     if (/\/voice\//.test(path)) return 'voice';
+    if (/\/assets\/local\/fx\//.test(path)) return 'fx';
     if (/\/sfx\//.test(path)) return 'sfx';
     if (/\/bgm\//.test(path)) return 'music';
     return 'other';
@@ -62,9 +71,14 @@ export function resourceGroup(file) {
 }
 
 /** Preload scope is independent of playback's global/individual operator dub settings. */
-export const PRELOAD_VOICE_LANGS = Object.freeze(['cn', 'jp', 'all', 'none']);
+export const PRELOAD_VOICE_LANGS = Object.freeze(['cn', 'jp', 'en', 'kr']);
+/** Canonical ordered array; migrate the old cn/jp/all/none radio preference without expanding its scope. */
 export function normalizePreloadVoiceLang(value, fallback = 'cn') {
-  return PRELOAD_VOICE_LANGS.includes(value) ? value : PRELOAD_VOICE_LANGS.includes(fallback) ? fallback : 'cn';
+  if (Array.isArray(value)) return PRELOAD_VOICE_LANGS.filter((lang) => value.includes(lang));
+  if (value === 'all') return ['cn', 'jp']; // the old choice meant "both", not future dubs
+  if (value === 'none') return [];
+  if (PRELOAD_VOICE_LANGS.includes(value)) return [value];
+  return PRELOAD_VOICE_LANGS.includes(fallback) ? [fallback] : ['cn'];
 }
 
 export function selectedResourceGroup(id, includeOptional, voiceLang = 'cn', preloadSkins = false) {
@@ -73,10 +87,9 @@ export function selectedResourceGroup(id, includeOptional, voiceLang = 'cn', pre
   if (group.tier === TIER_ESSENTIAL) return true;
   if (id === 'skins') return preloadSkins === true;
   if (!includeOptional) return false;
-  const lang = normalizePreloadVoiceLang(voiceLang);
-  if (id === 'voice_cn') return lang === 'cn' || lang === 'all';
-  if (id === 'voice_jp') return lang === 'jp' || lang === 'all';
-  if (id === 'voice') return lang !== 'none'; // legacy/shared voice URLs without a known dub
+  const langs = normalizePreloadVoiceLang(voiceLang);
+  if (id.startsWith('voice_')) return langs.includes(id.slice('voice_'.length));
+  if (id === 'voice') return langs.length > 0; // legacy/shared voice URLs without a known dub
   return true;
 }
 
@@ -237,8 +250,8 @@ export function validateResourcePacks(doc) {
     if (!pack || typeof pack.id !== 'string' || typeof pack.url !== 'string') return false;
     let parsed;
     try { parsed = new URL(pack.url, globalThis.location?.origin || 'https://resources.invalid'); } catch { return false; }
-    if (!['http:', 'https:'].includes(parsed.protocol)
-      || !/^\/resource-packs\/[A-Za-z0-9._-]+\.zip$/.test(parsed.pathname)
+    if (!isResourcePackUrl(pack.url)
+      || !/\/resource-packs\/[A-Za-z0-9._-]+\.zip$/.test(parsed.pathname)
       || parsed.username || parsed.password || parsed.search || parsed.hash
       || !Number.isSafeInteger(pack.size) || pack.size <= 0 || pack.size > RESOURCE_PACK_MAX_BYTES
       || !Array.isArray(pack.files) || pack.files.length === 0) return false;

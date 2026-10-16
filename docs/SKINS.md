@@ -8,12 +8,15 @@
 
 研究表涵盖 174 个干员的 273 套官方时装，不表示当前服务器已部署全部皮肤。数据源沿用官方 `skin_table.json`、
 fexli/ArknightsResource 模型和 yuanyan3060/ArknightsGameResource 头像。
-遵守项目的非商业、非官方声明和素材权利约定；只换头像及 Front/Back 模型，不改变特效、数值或技能。
+遵守项目的非商业、非官方声明和素材权利约定；只换头像、立绘及 Front/Back 模型，不改变特效、数值或技能。
 
 ## 玩家开关
 
 - **启用皮肤**（`skinsEnabled`）默认 false、浏览器持久化。开启后在「干员调配」选皮肤，也能看到其他玩家的选择；
   关闭时自己及他人全部默认外观，保留本机选择和缓存。关闭向服务器发送空选择，开启/重连按当前设置重新同步。
+- 每个干员详情只保留一个皮肤区域。启用后，加载中、加载失败及暂无可用皮肤均保留标题和关闭开关；
+  数据失败可重试。目录中有皮肤但服务器未部署模型时会明确说明，并保持默认外观，不自动安装或下载整套模型。
+  暂不可用的已选皮肤仍保留在本机，默认按钮可由玩家主动清除该干员的选择。
 - 观看者按自己的显示开关决定外观，不能用本机选择覆盖队友。准备期、精锐、查看队友、联防、首领半场、观战及
   简化 DOM 战场均走所属玩家的元数据。AI、补位、自选槽位保留默认。
 - 切换显示开关更新已在画面上的模型，不重建模拟单位、不重置 HP/SP 或战斗时间。局内修改选择更新准备期视图及
@@ -35,6 +38,37 @@ fexli/ArknightsResource 模型和 yuanyan3060/ArknightsGameResource 头像。
 手动暂停、关闭预载或清理不被自动恢复覆盖。
 ZIP 仍校验并保存包内未选择的有效皮肤，导出包含全部有效缓存；只在导入后的网络补缺按范围过滤。
 
+## 名片皮肤头像
+
+头像选择分两步：先搜索或按稀有度选择干员，再选择该干员的默认头像或皮肤头像。第二步可返回干员列表，
+保留搜索和稀有度；取消或关闭不更改原选择。皮肤目录仅在第二步读取，失败可重试，默认头像始终可选。
+只列出目录中且 `assets.chars[charId].skins[skinId].avatar` 已有头像的皮肤，不要求部署战场模型，
+不切换 `skinsEnabled` / `preloadSkins`，也不下载模型。缺少所选皮肤时保留偏好并显示该干员默认头像。
+
+沿用 `sp.pref.room.card` 和 `room.card` 的 `{ charId, avatar }`：`avatar` 可为旧的干员 ID 或完整皮肤 ID
+（如 `char_498_inside@kitchen#2`）。`charId` 决定房间立绘，也支持完整皮肤 ID。服务端校验格式及各自所属干员，
+URL 仅从该干员的素材清单解析；未知皮肤不构成任意 URL。大厅、房间、成就和结算页使用同一选择。
+结算同盟卡的立绘优先使用该玩家选择的房间立绘；未选、素材缺失或旧数据沿用阵容最高阶干员作为回退，
+不使用头像或其他玩家的本机选择替代立绘。
+复用原同步、断线重发及 Session/座位持久化，旧偏好无需迁移，不进入 Match Worker 游戏状态。
+
+## 皮肤立绘
+
+现有立绘位置统一支持皮肤：干员调配详情和卡片、商店、干员详情（含查看队友和战斗单位）、自选卡片的默认回退、
+个人结算阵容和同盟结算卡。游戏内立绘沿用所属玩家的基础 chessId 皮肤选择及观看者的 `skinsEnabled`，
+精锐沿用同一选择；战斗单位优先使用该场战斗携带的皮肤。AI、补位及自选槽位继续默认，不借用观看者的皮肤。
+关闭显示立即恢复默认，保留已选皮肤；立绘缺失或请求失败按普通/精锐回退原立绘。
+
+房间“更换立绘”先选干员，再选默认或已部署的皮肤立绘；返回保留搜索和稀有度，取消不保存。
+目录仅第二步按需加载，保留加载、重试、空状态及已选素材缺失提示。
+沿用 `{ charId, avatar }`，`charId` 可为旧干员 ID 或完整皮肤 ID，与头像独立，按所属干员的素材清单解析。
+名片立绘与名片头像一样独立于战场显示/预载开关，不要求模型；同房玩家、观战者及结算读取该玩家自己的选择。
+未知皮肤保留偏好并回退该干员原立绘，陌生干员、外部 URL 或非法路径仍拒绝。
+
+素材来自 yuanyan3060/ArknightsGameResource 的 `portrait/{portraitId}.png`（180×360），
+`portraitId` 已按官方 `skin_table.json` 对照写入研究表。无需下载数 MiB 的全尺寸 `skin/` 原画。
+清单字段为 `chars[charId].skins[skinId].portrait`；立绘属于可选皮肤预载、缓存与 ZIP 范围，沿用素材 CDN。
+
 ## 部署皮肤素材
 
 没有浏览器安装接口或 `room.skin.install`，游戏服务器不代玩家访问第三方下载站。
@@ -46,6 +80,8 @@ node tools/install-skins.mjs list
 node tools/install-skins.mjs add 'char_498_inside@kitchen#2'
 node tools/install-skins.mjs add-char char_498_inside
 node tools/install-skins.mjs add-all
+# 只为当前已安装的皮肤补齐立绘，不重装模型或改动安装选择：
+node tools/install-skins.mjs portraits
 node tools/asset-hashes.mjs
 ```
 
@@ -55,7 +91,7 @@ node tools/asset-hashes.mjs
 安装可中断重试；清单和记录各自原子写入，中断在两次写入之间时重新安装修复。不要并行运行安装/素材重建工具。
 
 同步新的 `data/assets.json`、`data/skins.json`、`data/asset-hashes.json` 到服务器及数据 CDN；
-同步 `public/assets/spine/op/<charId>/<skinStem>/` 和 `public/assets/char/avatar/skin/` 到素材 CDN。
+同步 `public/assets/spine/op/<charId>/<skinStem>/`、`public/assets/char/avatar/skin/` 和 `public/assets/char/portrait/skin/` 到素材 CDN。
 保留 CDN 前缀、CORS 头并按既有策略刷新缓存，目录表不能替代素材部署。数据更新后，若部署提供
 `scripts/copy-data-to-nginx.sh`，核对实际 Nginx alias；当前 `srv` 配置在仓库根目录执行：
 
@@ -65,6 +101,8 @@ sudo bash scripts/copy-data-to-nginx.sh ./data /opt/1panel/www/sites/wei.linxia.
 
 重新构建并重建镜像/容器，保留挂载、Redis 和公告排期；旧数据/素材挂载可能覆盖镜像内容。
 更新 SW（`resources/common.js` 变化）和 UI 语言 JSON。不承诺未经实测的线上进行中对局跨版本无缝恢复。
+本机直接运行 Node 时同样需要重启原服务进程：只重新构建、刷新页面会更新前端文件，但旧进程仍可能按旧规则拒绝
+皮肤立绘的 `room.card.charId`，返回 `BAD_MSG / bad field charId`，此时房间继续展示上次已确认的立绘。
 
 ## 协议和恢复
 

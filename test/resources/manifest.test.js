@@ -141,6 +141,13 @@ describe('resource manifest building', () => {
     for (const group of ['map/autochess', 'mesh/map_autochess_bkg', 'spine/enemy/x', 'projectiles']) {
       assert.equal(tierForPath(`local.groups.${group}.x.path`), TIER_ESSENTIAL);
     }
+    for (const group of ['fx', 'fx/prefabs', 'fx/mesh', 'fx/tex']) {
+      assert.equal(tierForPath(`local.groups.${group}.x.path`), TIER_REST);
+    }
+    const effects = collectResourceFiles({ ui: { fx: '/assets/local/fx/index.json' },
+      chars: { c: { fx: 'https://cdn.example/prefix/assets/local/fx/tex/a.webp' } } });
+    assert.equal(effects.length, 2);
+    assert.ok(effects.every(f => f.tier === TIER_REST), 'official FX remain optional even via essential aliases');
     assert.equal(tierForPath('chars.c.voice.attack'), TIER_REST);
     assert.equal(tierForPath('audio.voice.c.1'), TIER_REST);
     const nested = collectResourceFiles({ chars: { c: { sound: '/assets/audio/unknown.mp3' } } }, null);
@@ -398,13 +405,13 @@ describe('the resource index cache', () => {
     assert.equal(index.get(), first, 'cold requests share one pending build');
     const a = await first;
     assert.ok(a.manifest.files.some(f => f.url.endsWith('/tiles.json')), 'PNG/WebP atlases both include the crop sidecar');
-    assert.equal(reads.length, 4, 'the three present source bodies and the one tile body');
+    assert.equal(reads.length, 4, 'three source bodies and one tile body');
     reads.length = 0; stats.length = 0;
     const checks = Array.from({ length: 20 }, () => index.get());
     assert.ok(checks.every((check) => check === checks[0]), 'warm requests share only the ongoing check');
     for (const b of await Promise.all(checks)) assert.equal(b, a);
     assert.equal(reads.length, 0, 'no JSON or tile body read on a cache hit');
-    assert.equal(stats.length, 5, 'the four manifests (the packs index may be absent, it is still stamped) and the known tile companion');
+    assert.equal(stats.length, 5, 'only four manifests and the known tile companion');
     assert.equal(rewrites, 2, 'no CDN rewrite or resource traversal on a cache hit');
     await index.get();
     assert.equal(stats.length, 10, 'completed checks are not cached indefinitely');
@@ -587,4 +594,26 @@ describe('the resource index cache', () => {
     assert.ok(m.count > 0, 'the list is still complete: the client preloads from the CDN');
     inst.cleanup();
   });
+});
+
+ test('official effect JSON is a resource: separate manifest, hashes, CDN, sizes and source invalidation', async t => {
+  const paths = ['index.json', 'textures.json', 'prefabs/skill_probe.json', 'mesh/unit_mesh.json'].map(x => '/assets/local/fx/' + x);
+  const inst = install({ assets: null, localDoc: null, files: paths.map(p => p.slice(1)) });
+  t.after(inst.cleanup);
+  const source = path.join(inst.dataDir, 'local-fx.json');
+  const doc = hash => ({ groups: { 'fx/probe': Object.fromEntries(paths.map((p, i) => [i, { path: p, hash }])) } });
+  fs.writeFileSync(source, JSON.stringify(doc('aaaaaaaaaaaa')));
+  const index = createResourceIndex({ dataDir: inst.dataDir, publicDir: inst.publicDir,
+    cdnBase: 'https://cdn.example.com', rewrite: v => rewriteAssetPaths(v, 'https://cdn.example.com') });
+  const a = await index.get();
+  assert.equal(a.manifest.files.length, paths.length);
+  assert.ok(a.manifest.files.every(f => f.url.startsWith('https://cdn.example.com/assets/local/fx/') && f.tier === TIER_REST && f.size > 0 && f.hash === 'aaaaaaaaaaaa'));
+  for (const p of paths) assert.equal(isResourcePath(p), true, p);
+  for (const p of ['/assets/local/fx/secrets.json', '/assets/local/fx/prefabs/nested/config.json', '/assets/local/fx/../config.json']) assert.equal(validateResourceUrl(p), false, p);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  fs.writeFileSync(source, JSON.stringify(doc('bbbbbbbbbbbb')));
+  const b = await index.get();
+  assert.notEqual(b.etag, a.etag);
+  assert.notEqual(b.manifest.version, a.manifest.version);
+  assert.ok(b.manifest.files.every(f => f.hash === 'bbbbbbbbbbbb'));
 });

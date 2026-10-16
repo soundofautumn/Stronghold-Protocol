@@ -26,6 +26,17 @@ const INDEX_FLUSH_EVERY = 64;
 const SMALL_IMPORT_BYTES = 256 * 1024;
 const IMPORT_BUFFER_BYTES = 4 * SMALL_IMPORT_BYTES;
 
+/** Presence/length-header check only: deliberately not a body-size or integrity check. */
+function hasContentLength(response) {
+  const value = response?.headers.get('content-length');
+  return value != null && /^\d+$/.test(value) && Number.isSafeInteger(Number(value));
+}
+
+/** Chromium can reject Cache.keys() when its aggregate IPC result is too large. */
+export function isCacheReadTooLarge(error) {
+  return /(?:operation|result|message|response).{0,24}too large/i.test(String(error?.message || error));
+}
+
 /**
  * The 12-hex SHA-1 of a response body — the same digest the server puts in the manifest (tools/asset-hashes.mjs,
  * tools/local-extract/extract.py). WebCrypto has no streaming digest, so one file is read at a time (Big files go
@@ -312,11 +323,12 @@ export class ResourceStore {
     const headers = new Headers();
     const type = response.headers.get('content-type');
     if (type) headers.set('Content-Type', type);
+    // `#fetchStorable` normalizes new encoded/lengthless downloads before this point.
     // A stored body must never claim a length it does not have: `fetch` hands us the DECODED body, so a compressed
     // transfer's Content-Length (372 for a 100 000-byte gzipped .skel) would describe the wrong bytes and the browser
     // would truncate it. Keep the header only when the response was not content-encoded — there it is exactly the
     // length we store (and DevTools' Cache Storage view can show a size instead of 0).
-    if (!response.headers.get('content-encoding')) {
+    if (!response.headers.get('content-encoding') && hasContentLength(response)) {
       const len = Number(response.headers.get('content-length'));
       if (Number.isSafeInteger(len) && len >= 0) headers.set('Content-Length', String(len));
     }
@@ -326,7 +338,8 @@ export class ResourceStore {
   }
 
   /**
-   * Default: enumerate real cache keys and compare recorded fingerprints.
+   * Default: check real cache entries and Content-Length headers, never their bodies.
+   * Recorded fingerprints still determine the revision; no body integrity is checked.
    * verifyCache:false: return a provisional metadata-only snapshot for startup;
    * callers must schedule a full check to detect eviction and repair the indexes.
    * @param {{ verifyCache?: boolean }} [opts]
@@ -348,6 +361,7 @@ export class ResourceStore {
     const cache = await this.caches.open(this.cacheName);
     let keysMs = 0;
     let indexMs = 0;
+    let headerMs = 0;
     const readIndex = async () => {
       const start = performance.now();
       try {
@@ -355,15 +369,52 @@ export class ResourceStore {
         return { ...index, files: { ...runtime, ...index.files } };
       } finally { indexMs = performance.now() - start; }
     };
+    const metadata = readIndex();
+    let enumerationLimited = false;
     const readKeys = async () => {
       const start = performance.now();
-      try { return await cache.keys(); } finally { keysMs = performance.now() - start; }
+      try { return await cache.keys(); }
+      catch (error) {
+        if (!isCacheReadTooLarge(error)) throw error;
+        enumerationLimited = true;
+        // Cache API has no pagination. Probe known manifest/index identities
+        // in bounded lanes without loading bodies or returning one huge list.
+        const index = await metadata;
+        const urls = [...new Set([...this.entries.map((entry) => entry.key), ...Object.keys(index.files)])];
+        const found = [];
+        let next = 0;
+        await Promise.all(Array.from({ length: Math.min(8, urls.length) }, async () => {
+          for (let i = next++; i < urls.length; i = next++) {
+            const matches = await cache.keys(urls[i]);
+            if (matches.some((request) => request.url === urls[i])) found.push({ url: urls[i] });
+          }
+        }));
+        return found;
+      } finally { keysMs = performance.now() - start; }
     };
-    const [index, keys] = await Promise.all([readIndex(), verifyCache ? readKeys() : null]);
+    const [index, keys] = await Promise.all([metadata, verifyCache ? readKeys() : null]);
     const cached = new Set(keys ? keys.map((k) => k.url) : Object.keys(index.files));
     const fresh = this.#fresh(cached, index);
-    return { ...this.#tally(fresh), present: fresh, ...(verifyCache ? { cachedKeys: cached } : {}), cacheVerified: !!verifyCache,
-      checkTimings: { statusMs: performance.now() - started, cacheKeysMs: keysMs, indexReadMs: indexMs, verified: !!verifyCache } };
+    if (verifyCache) {
+      const headerStart = performance.now();
+      // Bounded metadata reads: never clone/read/hash a resource body. A valid
+      // length header is sufficient, even if it differs from the manifest size.
+      const candidates = [...fresh];
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(8, candidates.length) }, async () => {
+        for (let i = next++; i < candidates.length; i = next++) {
+          if (!hasContentLength(await cache.match(candidates[i]))) {
+            fresh.delete(candidates[i]);
+            cached.delete(candidates[i]);
+          }
+        }
+      }));
+      headerMs = performance.now() - headerStart;
+    }
+    return { ...this.#tally(fresh), present: fresh, ...(verifyCache ? { cachedKeys: cached } : {}),
+      enumerationLimited, cacheVerified: !!verifyCache,
+      checkTimings: { statusMs: performance.now() - started, cacheKeysMs: keysMs, indexReadMs: indexMs,
+        headerCheckMs: headerMs, verified: !!verifyCache } };
   }
 
   /** The subset of `cached` whose recorded hash equals the manifest's.
@@ -400,7 +451,7 @@ export class ResourceStore {
     });
   }
 
-  /** Caches of earlier builds this app wrote: their entries carry no hash record and are verified before being kept. */
+  /** Earlier layouts: reuse entries with a length header without reading or hashing their bodies. */
   async #olderCaches() {
     const names = (await this.caches.keys()) || [];
     return names.filter((n) => n.startsWith(CACHE_PREFIX) && n !== this.cacheName);
@@ -411,29 +462,40 @@ export class ResourceStore {
     const res = await this.fetcher(url, { mode: 'cors', credentials: 'omit', cache: 'no-store', signal });
     if (res.type === 'opaque' || !res.body) throw new Error('响应不可读取（缺少 CORS 头或空响应）');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    // Cache entries need the decoded body's length for the next header-only
+    // inspection. Never retain a compressed wire length or invent zero when
+    // Content-Length is absent. This reads only a newly downloaded response.
+    if (res.headers.get('content-encoding') || !hasContentLength(res)) {
+      const bytes = await res.arrayBuffer();
+      if (bytes.byteLength > MAX_FILE_BYTES) throw new Error('资源大小无效');
+      const headers = new Headers(res.headers);
+      headers.delete('content-encoding');
+      headers.set('content-length', String(bytes.byteLength));
+      return new Response(bytes, { headers });
+    }
     return res;
   }
 
   /**
-   * Rescue a file from a cache of the previous layout instead of downloading it again: hash the stored bytes and, when
-   * they are exactly the revision this manifest wants, move the entry into the current cache. A mismatching entry is
-   * dropped (the caller downloads the right bytes next) so a stale copy can never shadow the fresh one.
+   * Rescue a file from an earlier cache layout using existence and a length header only.
+   * No body read/hash: legacy bytes may be stale or corrupt; this is an explicit speed trade-off.
    * @returns {Promise<boolean>} true when the file needed no network at all
    */
   async #adopt(file, cache, older) {
-    if (!older.length || !file.hash || !CONTENT_HASH_RE.test(file.hash)) return false; // nothing to compare against
+    if (!older.length) return false;
     const key = this.keyOf(file.url);
     for (const name of older) {
       const other = await this.caches.open(name);
       const hit = await other.match(key);
       if (!hit) continue;
-      if ((await digestOf(hit)) === file.hash) {
+      if (hasContentLength(hit)) {
         await cache.put(key, hit); // same bytes, now in the current cache…
         await other.delete(key); // …and gone from the old one: never two copies, never a stale shadow
         return true;
       }
+      // Keep probing older layouts: a lengthless copy must not hide another
+      // usable entry. Missing headers never authorize reading the saved body.
       await other.delete(key);
-      return false;
     }
     return false;
   }
@@ -665,7 +727,14 @@ export class ResourceStore {
     const wanted = new Map(this.files.map((f) => [this.keyOf(f.url), f]));
     const indexKey = indexUrl(this.origin);
     const runtimeKey = runtimeIndexUrl(this.origin);
-    const keys = await cache.keys();
+    let keys;
+    try { keys = await cache.keys(); }
+    catch (error) {
+      if (!isCacheReadTooLarge(error)) throw error;
+      // Unknown stale keys cannot be discovered safely without enumeration;
+      // retain them rather than block preload or delete valid resources.
+      return 0;
+    }
     const index = await this.#readIndex(cache);
     const doomed = keys.filter((k) => {
       if (k.url === indexKey || k.url === runtimeKey) return false;

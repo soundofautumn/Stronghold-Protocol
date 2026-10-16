@@ -43,6 +43,55 @@ const SKIN_FILES = [
 ];
 const SKIN_MANIFEST = { ...MANIFEST, version: 'skin-scope', files: SKIN_FILES, tier1: 1, totalBytes: 16 };
 
+test('all selected pack requests precede slow essential per-file fallback, including skins', async (t) => {
+  const files = [SKIN_FILES[0], SKIN_FILES[2]].map((file) => ({
+    ...file, hash: createHash('sha1').update('b'.repeat(file.size)).digest('hex').slice(0, 12),
+  }));
+  const pack = { id: 'skins-1', tier: 2, size: 100, sha1: 'a'.repeat(40),
+    url: '/resource-packs/skins-1.zip', urls: ['https://mirror.example/data/skins-1.zip'], files: [files[1]] };
+  const env = stubEnv({ manifest: { ...SKIN_MANIFEST, files, packs: [pack] } });
+  t.after(env.restore);
+  const fetcher = globalThis.fetch;
+  const order = [];
+  globalThis.fetch = async (url, options) => {
+    order.push(url);
+    if (url === pack.url || url === pack.urls[0]) return new Response(null, { status: 404 });
+    return fetcher(url, options);
+  };
+  const mod = await import('../../public/js/resources/index.js?packs-before-gaps');
+  await mod.syncResources(true, false, 'cn', true);
+  assert.ok(order.indexOf(pack.urls[0]) < order.indexOf(pack.url));
+  assert.ok(order.indexOf(pack.url) < order.indexOf(ORIGIN + files[0].url));
+  assert.equal(mod.resourceState().selectionComplete, true);
+  await mod.syncResources(false);
+});
+
+test('continue retries incomplete files even when aggregate Cache.keys fails and never reports ready for gaps', async (t) => {
+  const env = stubEnv(); t.after(env.restore);
+  const cache = await env.caches.open(CACHE_NAME);
+  cache.keys = async (key) => {
+    if (!key) throw new Error('Failed to read: Operation too large.');
+    return cache.entries.has(key) ? [new Request(key)] : [];
+  };
+  let fail = true;
+  const fetcher = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    if (fail && url === ORIGIN + FILES[1].url) return new Response(null, { status: 503 });
+    return fetcher(url, options);
+  };
+  const mod = await import('../../public/js/resources/index.js?resume-large-cache');
+  await mod.syncResources(true, false);
+  assert.equal(mod.resourceState().selectionComplete, false);
+  assert.equal(mod.resourceState().phase, 'error');
+  assert.equal(mod.resourceState().failed, 1);
+  fail = false;
+  await mod.startResources();
+  assert.equal(mod.resourceState().selectionComplete, true);
+  assert.equal(mod.resourceState().phase, 'ready');
+  assert.equal(mod.resourceState().failed, 0);
+  await mod.syncResources(false);
+});
+
 test('skin preloading is independent: optional audio never opts in skins, skins need no audio opt-in', async t => {
   const env = stubEnv({ manifest: SKIN_MANIFEST }); t.after(env.restore);
   const mod = await import('../../public/js/resources/index.js?skins-independent');
@@ -224,7 +273,7 @@ test('complete indexed startup skips scans; deferred verification detects evicti
   const files = {};
   for (const file of FILES) {
     const key = ORIGIN + file.url;
-    await cache.put(key, new Response('b'.repeat(file.size)));
+    await cache.put(key, new Response('b'.repeat(file.size), { headers: { 'Content-Length': String(file.size) } }));
     files[key] = null;
   }
   await cache.put(indexUrl(ORIGIN), new Response(JSON.stringify({ version: 1, manifest: MANIFEST.version, files })));
@@ -616,6 +665,42 @@ const VOICE_FILES = [
 const VOICE_MANIFEST = { format: 1, version: 'voice-scope', files: VOICE_FILES, totalBytes: 14, sized: 4 };
 const cacheKey = (f) => new URL(f.url, ORIGIN).href;
 
+test('multi-select English/Korean voices and optional FX download only the selected scope and retain caches', async (t) => {
+  const files = [VOICE_FILES[0], ...['cn', 'jp', 'en', 'kr'].map(lang => ({
+    url: `https://cdn.example/prefix/assets/audio/voice/${lang}/char_test/cn_019.mp3`, tier: 2, size: 3,
+  })), ...['index.json', 'textures.json', 'prefabs/probe.json', 'mesh/probe.json', 'tex/half/probe.webp'].map(file => ({
+    url: `https://cdn.example/prefix/assets/local/fx/${file}`, tier: 2, size: 3,
+  }))];
+  const manifest = { format: 1, version: 'four-dubs-fx', files, totalBytes: 31, sized: files.length };
+  const env = stubEnv({ manifest }); t.after(env.restore);
+  const mod = await import('../../public/js/resources/index.js?four-dubs-fx');
+  await mod.syncResources(true, false, ['en', 'kr']);
+  assert.deepEqual(env.calls.fetch, [MANIFEST_URL, cacheKey(files[0])], 'essentials alone exclude voices and FX');
+  assert.equal(mod.resourceState().selectionComplete, true);
+  assert.equal(mod.resourceState().groups.find(g => g.id === 'fx').selected, false);
+  const before = env.calls.fetch.length;
+  await mod.syncResources(true, true, ['en', 'kr']);
+  const selected = files.filter(f => /\/voice\/(?:en|kr)\/|\/local\/fx\//.test(f.url));
+  assert.deepEqual(env.calls.fetch.slice(before).sort(), selected.map(cacheKey).sort());
+  assert.deepEqual(mod.resourceState().voiceLang, ['en', 'kr']);
+  assert.equal(mod.resourceState().selectedWanted, 8);
+  assert.equal(mod.resourceState().selectionComplete, true);
+  assert.equal(mod.resourceState().groups.find(g => g.id === 'fx').present, 5);
+  const cached = env.calls.fetch.length;
+  const snapshots = []; const unsubscribe = mod.subscribeResources(s => snapshots.push(s)); t.after(unsubscribe);
+  await mod.syncResources(true, true, ['kr', 'en', 'en']);
+  assert.equal(snapshots.length, 0, 'equivalent checkbox arrays are an idempotent sync, not a new cache check');
+  const snapshot = mod.resourceState(); snapshot.voiceLang.push('cn');
+  assert.deepEqual(mod.resourceState().voiceLang, ['en', 'kr'], 'snapshots cannot mutate the active language scope');
+  await mod.syncResources(true, true, []);
+  assert.equal(env.calls.fetch.length, cached, 'equivalent or empty selections never re-download');
+  assert.equal(mod.resourceState().selectedWanted, 6, 'no voices still includes optional FX');
+  await mod.syncResources(true, false, []);
+  assert.equal(mod.resourceState().selectedWanted, 1);
+  assert.equal(mod.resourceState().groups.find(g => g.id === 'fx').present, 5, 'disabling optional resources keeps cached FX');
+  await mod.syncResources(false);
+});
+
 test('Chinese/Japanese scope downloads incrementally, counts selected files and keeps both cached dubs', async (t) => {
   const env = stubEnv({ manifest: VOICE_MANIFEST }); t.after(env.restore);
   const mod = await import('../../public/js/resources/index.js?voice-dub-scope');
@@ -657,10 +742,10 @@ test('voice selection during active downloads aborts old scope; rapid changes us
     return fetcher(url, options);
   };
   const mod = await import('../../public/js/resources/index.js?voice-scope-race');
-  const original = mod.syncResources(true, true, 'cn'); await started.promise;
-  const next = mod.syncResources(true, true, 'jp'); const old = mod.syncResources(true, true, 'cn');
-  const latest = mod.syncResources(true, true, 'jp'); await Promise.all([original, next, old, latest]);
-  assert.equal(mod.resourceState().voiceLang, 'jp'); assert.equal(mod.resourceState().selectionComplete, true);
+  const original = mod.syncResources(true, true, ['cn']); await started.promise;
+  const next = mod.syncResources(true, true, ['cn', 'jp']); const old = mod.syncResources(true, true, []);
+  const latest = mod.syncResources(true, true, ['jp']); await Promise.all([original, next, old, latest]);
+  assert.deepEqual(mod.resourceState().voiceLang, ['jp']); assert.equal(mod.resourceState().selectionComplete, true);
   const cache = await env.caches.open(CACHE_NAME);
   assert.equal(await cache.match(cacheKey(VOICE_FILES[1])), undefined);
   assert.ok(await cache.match(cacheKey(VOICE_FILES[2])));
@@ -677,7 +762,7 @@ test('ZIP import keeps valid unselected voices but incremental completion fetche
   const mod = await import('../../public/js/resources/index.js?voice-zip-scope');
   await mod.syncResources(false, true, 'cn'); await mod.importResources(blob); await mod.startResources();
   assert.deepEqual(env.calls.fetch, [MANIFEST_URL, ...files.filter((_, i) => i !== 2).map(cacheKey)]);
-  assert.equal(mod.resourceState().voiceLang, 'cn'); assert.equal(mod.resourceState().selectionComplete, true);
+  assert.deepEqual(mod.resourceState().voiceLang, ['cn']); assert.equal(mod.resourceState().selectionComplete, true);
   assert.equal(mod.resourceState().selectedWanted, 3);
   assert.equal(mod.resourceState().groups.find((g) => g.id === 'voice_jp').present, 1);
   assert.equal((await mod.exportResources()).count, 4, 'ZIP export still includes every cached valid resource');
@@ -709,7 +794,7 @@ test('restored combat defers enabled preload/inspection without changing user ch
   assert.deepEqual(env.calls.fetch, [], 'no manifest/cache check or bulk resource request during initial combat');
   assert.equal(mod.resourceState().enabled, true);
   assert.equal(mod.resourceState().combatPaused, true);
-  assert.equal(mod.resourceState().voiceLang, 'jp');
+  assert.deepEqual(mod.resourceState().voiceLang, ['jp']);
   assert.match(mod.resourceState().message, /战斗中/);
   assert.ok(env.calls.registered.length > 0, 'runtime SW remains available');
   await mod.syncResourceCombat(false);

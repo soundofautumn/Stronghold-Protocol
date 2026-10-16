@@ -21,6 +21,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { canonicalResourceUrl, isBoardResourceJson } from '../shared/resourcePaths.js';
+import { routeResourcePacks } from '../shared/resourcePackRoutes.js';
 
 export const RESOURCE_MANIFEST_FILE = 'resource-manifest.json';
 export const RESOURCE_PACK_MANIFEST_FILE = 'resource-packs.json';
@@ -38,7 +39,7 @@ export function shortHash(text) {
 export const MAX_FILE_BYTES = 24 * 1024 * 1024;
 /** Required visuals: maps/meshes, portraits, Spine, fonts, UI and icons. */
 export const TIER_ESSENTIAL = 1;
-/** Optional: voices, sound effects, music and tutorial illustrations. */
+/** Optional: voices, official battle effects, sound effects, music and tutorial illustrations. */
 export const TIER_REST = 2;
 
 /** Extension → MIME type. Mirrored by the client (public/js/resources/common.js) for URL validation. */
@@ -98,13 +99,14 @@ const TIER_ESSENTIAL_SECTIONS = new Set(['ui', 'prof', 'bonds', 'items', 'bands'
 
 /**
  * Preload tier of a manifest entry, from its key path (`chars.char_002_amiya.spine.front.skel`). Operators, tokens and
- * images, Spine and map geometry are all required. Audio and tutorial illustrations are optional. Local groups use
+ * images, base Spine and map geometry are required. Audio, official FX and tutorial illustrations are optional. Local groups use
  * slash-containing names (map/autochess, spine/enemy/…), so classification must handle both '/' and '.'.
  */
 export function tierForPath(keyPath) {
   const p = String(keyPath || '');
   const segments = p.split(/[./]/);
   const head = segments[0];
+  if (head === 'local' && segments[1] === 'groups' && segments[2] === 'fx') return TIER_REST;
   if (segments.some((s) => ['audio', 'voice', 'voices', 'sfx', 'bgm', 'guide', 'skins'].includes(s))) return TIER_REST;
   if (head === 'local') return TIER_ESSENTIAL;
   return TIER_ESSENTIAL_SECTIONS.has(head) ? TIER_ESSENTIAL : TIER_REST;
@@ -124,8 +126,9 @@ export function collectResourceFiles(assets, local) {
   const walk = (node, keyPath, source) => {
     if (typeof node === 'string') {
       if (!validateResourceUrl(node)) return;
-      // Audio is optional even when a new manifest nests it inside an otherwise required character/map section.
-      const tier = resourceType(node)?.startsWith('audio/') ? TIER_REST : tierForPath(keyPath);
+      // Audio and official battle FX stay optional even under otherwise required character/map sections.
+      const tier = resourceType(node)?.startsWith('audio/') || /\/assets\/local\/fx\//.test(pathKey(node))
+        ? TIER_REST : tierForPath(keyPath);
       const url = canonicalResourceUrl(node);
       const prev = byUrl.get(url);
       if (prev == null || tier < prev.tier) byUrl.set(url, { tier, source });
@@ -255,11 +258,11 @@ export function localPathFor(url, publicDir, cdnBase = '') {
 
 /**
  * The served resource manifest, built from the data directory and cached until one of its sources changes.
- * @param {{ dataDir: string, publicDir: string, cdnBase?: string, rewrite?: (v: any) => any,
+ * @param {{ dataDir: string, publicDir: string, cdnBase?: string, resourcePackRoutes?: string[], rewrite?: (v: any) => any,
  *           statFile?: (p: string) => Promise<{ isFile(): boolean, size: number, mtimeMs: number }>,
  *           readFile?: typeof fsp.readFile, log?: any }} opts
  */
-export function createResourceIndex({ dataDir, publicDir, cdnBase = '', rewrite = (v) => v,
+export function createResourceIndex({ dataDir, publicDir, cdnBase = '', resourcePackRoutes = [], rewrite = (v) => v,
   statFile = (p) => fsp.stat(p), readFile = fsp.readFile, log = null } = {}) {
   /** @type {{ key: string, sourceKey: string, tileFiles: { url: string }[], body: Buffer, gzip: Buffer,
    *   etag: string, mtimeMs: number, manifest: any } | null} */
@@ -320,7 +323,7 @@ export function createResourceIndex({ dataDir, publicDir, cdnBase = '', rewrite 
 
   async function build(epoch) {
     const previous = cache;
-    const sources = await Promise.all(['assets.json', 'local-assets.json', ASSET_HASHES_FILE].map(sourceFile));
+    const sources = await Promise.all(['assets.json', 'local-assets.json', ASSET_HASHES_FILE, 'local-fx.json'].map(sourceFile));
     // The optional pack index is probed only when it exists. Keeping it out of
     // the normal source stat set preserves the cheap three-manifest startup
     // path for installs that publish packs nowhere.
@@ -338,10 +341,10 @@ export function createResourceIndex({ dataDir, publicDir, cdnBase = '', rewrite 
       const key = [sourceKey, ...tiles.map((file) => file?.stamp || '-')].join('|');
       if (previous.key === key) return previous;
     }
-    const [assets, local, hashesDoc] = await Promise.all(sources.map(readJson));
+    const [assets, local, hashesDoc, fx] = await Promise.all(sources.map(readJson));
     const packsDoc = await readJson(packSource);
     const assetsDoc = assets ? rewrite(assets.doc) : null;
-    const localDoc = local ? rewrite(local.doc) : null;
+    const localDoc = local || fx ? rewrite({ ...(local?.doc || {}), groups: { ...(local?.doc?.groups || {}), ...(fx?.doc?.groups || {}) } }) : null;
     const collected = collectResourceFiles(assetsDoc, localDoc);
     const tileFiles = collected.filter((f) => /\/assets\/local\/map\/autochess\/tiles\.json$/.test(f.url));
     const tiles = await tileSources(tileFiles);
@@ -362,20 +365,7 @@ export function createResourceIndex({ dataDir, publicDir, cdnBase = '', rewrite 
     const manifest = buildResourceManifest({ files, sizes: await measure(files), version, hashes: fileHashes });
     const packs = packsDoc?.doc;
     if (packs && packs.format === 'stronghold-resource-pack-index' && packs.version === 1) {
-      const base = String(cdnBase || '').replace(/\/+$/, '');
-      manifest.packs = (packs.packs || []).map((pack) => ({
-        ...pack,
-        url: base && typeof pack.url === 'string' && pack.url.startsWith('/')
-          ? `${base}${pack.url}` : pack.url,
-        files: Array.isArray(pack.files) ? pack.files.map((file) => ({
-          ...file,
-          // The normal resource manifest keeps fonts same-origin; only
-          // /assets/ URLs are rewritten by rewriteAssetPaths. Keep pack file
-          // identities byte-for-byte aligned with that manifest.
-          url: base && typeof file.url === 'string' && file.url.startsWith('/assets/')
-            ? `${base}${file.url}` : file.url,
-        })) : pack.files,
-      }));
+      manifest.packs = routeResourcePacks(packs.packs, cdnBase, resourcePackRoutes);
     }
     const body = Buffer.from(JSON.stringify(manifest));
     // Hash the complete response (including tiers and sizes), so unchanged rebuilds/restarts keep their validator.
